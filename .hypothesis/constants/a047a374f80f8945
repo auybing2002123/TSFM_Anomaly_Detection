@@ -1,0 +1,4 @@
+# file: E:\code\paper\code\TSFM_Anomaly_Detection\models\tsfm_ad.py
+# hypothesis_version: 6.150.0
+
+[0.1, 1.0, 100, 256, 'TSFMADModel', 'anomaly_score', 'attention', 'backbone', 'backbone_total', 'backbone_trainable', 'cache', 'cache_dir', 'config', 'cpu', 'data', 'dropout', 'epoch', 'freeze_backbone', 'fusion_learnable', 'head_total', 'head_trainable', 'hidden_dim', 'loss_lambda', 'metrics', 'model', 'n_features', 'num_layers', 'optimizer_state_dict', 'paths', 'pooling', 'pred', 'pred_loss', 'pred_score', 'recon', 'recon_loss', 'recon_score', 'total', 'total_loss', 'trainable', 'training', 'window_size']

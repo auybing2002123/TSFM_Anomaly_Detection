@@ -1,0 +1,4 @@
+# file: E:\code\paper\code\TSFM_Anomaly_Detection\data\data_loader.py
+# hypothesis_version: 6.150.0
+
+[0.1, 100, '=', 'MSL', 'PSM', 'SMAP', 'SMD', 'batch_size', 'csv', 'data', 'data/datasets', 'exists', 'format', 'local_path', 'metadata', 'n_features', 'n_machines', 'name', 'normalize', 'npy', 'num_workers', 'preprocessing', 'preprocessor', 'r', 'random_seed', 'stride', 'supported', 'test', 'test_data', 'test_dataset', 'test_labels', 'test_windows', 'train', 'train_data', 'train_dataset', 'train_windows', 'training', 'txt', 'val_dataset', 'val_ratio', 'val_windows', 'window_size', '✓ Downloaded', '✗ Not downloaded']

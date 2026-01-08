@@ -1,0 +1,4 @@
+# file: E:\code\paper\code\TSFM_Anomaly_Detection\utils\domain_loss.py
+# hypothesis_version: 6.150.0
+
+[0.0, 1e-08, 0.1, 1.0, 2.0, 'anomaly_loss', 'coral', 'domain_loss', 'linear', 'mmd', 'rbf', 'total_loss']

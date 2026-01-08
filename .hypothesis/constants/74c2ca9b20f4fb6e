@@ -1,0 +1,4 @@
+# file: E:\code\paper\code\TSFM_Anomaly_Detection\data\parsers\base.py
+# hypothesis_version: 6.150.0
+
+['anomaly_count', 'anomaly_ratio', 'base', 'dataset_name', 'metadata', 'n_features', 'test_data', 'test_labels', 'test_size', 'train_data', 'train_size']

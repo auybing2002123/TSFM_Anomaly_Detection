@@ -1,0 +1,54 @@
+# TSFM-AD Model Configuration
+# Default configuration for training and evaluation
+
+model:
+  # Backbone settings
+  backbone: amazon/chronos-t5-small  # Options: chronos-t5-tiny/mini/small/base/large
+  freeze_backbone: true              # Freeze backbone parameters
+  
+  # Detection head settings
+  hidden_dim: 256                    # Hidden dimension for detection head
+  num_layers: 2                      # Number of MLP layers
+  dropout: 0.1                       # Dropout probability
+  pooling: attention                 # Options: mean, attention, flatten
+  fusion_learnable: true             # Whether fusion weights are learnable
+
+data:
+  dataset: SMD                       # Dataset name (SMD, MSL, SMAP, PSM)
+  window_size: 100                   # Input window size
+  stride: 100                        # Sliding window stride (same as One_Fits_All default)
+  n_features: 38                     # Number of features (auto-detected if not set)
+  train_ratio: 0.8                   # Train/val split ratio
+  normalize: true                    # Whether to normalize data
+
+training:
+  batch_size: 64                     # Training batch size
+  epochs: 50                         # Maximum training epochs
+  lr: 0.0001                         # Learning rate
+  weight_decay: 0.00001              # Weight decay for AdamW
+  loss_lambda: 1.0                   # Weight for prediction loss
+  early_stopping_patience: 10        # Early stopping patience
+  gradient_clip: 1.0                 # Gradient clipping max norm
+  scheduler: cosine                  # LR scheduler (cosine, step, none)
+  warmup_epochs: 5                   # Warmup epochs for scheduler
+
+evaluation:
+  point_adjust: true                 # Use point-adjusted metrics
+  threshold_search: best_f1          # Threshold search method (best_f1, best_precision)
+  n_thresholds: 100                  # Number of thresholds to search
+
+paths:
+  cache_dir: cache                   # Model cache directory
+  checkpoint_dir: checkpoints        # Checkpoint save directory
+  log_dir: logs                      # Training log directory
+  data_dir: data/processed           # Processed data directory
+
+logging:
+  tensorboard: true                  # Enable TensorBoard logging
+  log_interval: 10                   # Log every N batches
+  save_interval: 5                   # Save checkpoint every N epochs
+
+# Hardware settings
+device: auto                         # Device (auto, cuda, cpu)
+seed: 42                             # Random seed for reproducibility
+num_workers: 4                       # DataLoader workers

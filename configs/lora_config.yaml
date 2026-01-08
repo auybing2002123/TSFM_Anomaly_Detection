@@ -1,0 +1,68 @@
+# LoRA/DA-LoRA Configuration
+# Configuration for Low-Rank Adaptation fine-tuning of TSFM-AD models
+#
+# LoRA enables parameter-efficient fine-tuning by adding low-rank matrices
+# to frozen pre-trained weights: W' = W + (α/r) · B · A
+#
+# Reference: Hu et al., "LoRA: Low-Rank Adaptation of Large Language Models", ICLR 2022
+
+# LoRA Configuration
+lora:
+  # Whether LoRA is enabled
+  enabled: true
+  
+  # LoRA rank (r): Controls the number of trainable parameters
+  # Lower rank = fewer parameters but less expressiveness
+  # Typical values: 4, 8, 16, 32
+  # For Chronos-T5-small with rank=8: ~0.1% trainable parameters
+  rank: 8
+  
+  # Scaling factor (α): Controls the magnitude of LoRA updates
+  # Higher alpha = stronger LoRA influence
+  # Common practice: alpha = 2 * rank
+  alpha: 16.0
+  
+  # Dropout probability for LoRA layers
+  # Helps prevent overfitting during fine-tuning
+  dropout: 0.1
+  
+  # Target modules to inject LoRA into
+  # For T5/Chronos models:
+  #   - Attention: 'q' (query), 'k' (key), 'v' (value), 'o' (output)
+  #   - Feed-forward: 'wi' (intermediate), 'wo' (output)
+  # Default: ['q', 'v'] - most parameter-efficient choice
+  target_modules:
+    - q
+    - v
+  
+  # Bias handling mode
+  # Options:
+  #   - 'none': No bias training (default, most efficient)
+  #   - 'all': Train all biases
+  #   - 'lora_only': Train only LoRA layer biases
+  bias: none
+
+# DA-LoRA Domain Alignment Configuration
+# Extends LoRA with domain alignment loss for cross-domain transfer
+# L_total = L_anomaly + λ · L_domain
+domain_alignment:
+  # Whether domain alignment is enabled
+  # Set to true when fine-tuning on a new domain/dataset
+  enabled: false
+  
+  # Domain alignment method
+  # Options:
+  #   - 'mmd': Maximum Mean Discrepancy (default)
+  #   - 'coral': Correlation Alignment
+  method: mmd
+  
+  # Weight for domain alignment loss (λ)
+  # Higher values = stronger domain alignment
+  # Typical range: 0.01 - 1.0
+  lambda: 0.1
+  
+  # Kernel type for MMD (only used when method='mmd')
+  # Options:
+  #   - 'rbf': Radial Basis Function (Gaussian) kernel (default)
+  #   - 'linear': Linear kernel
+  kernel: rbf

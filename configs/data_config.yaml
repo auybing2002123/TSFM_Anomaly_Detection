@@ -1,0 +1,49 @@
+# TSFM-AD Data Configuration
+# This file contains default parameters for data loading and preprocessing
+
+data:
+  # Dataset name: SMD, MSL, SMAP, PSM
+  dataset_name: SMD
+  # Specific subset (machine/entity), null for all
+  subset: null
+  # Data storage directory
+  data_dir: data/datasets
+
+preprocessing:
+  # Sliding window size
+  window_size: 100
+  # Sliding stride
+  stride: 1
+  # Whether to apply z-score normalization
+  normalize: true
+  # Channel-independent mode (for Chronos)
+  channel_independent: false
+
+training:
+  # Validation set ratio from training data
+  val_ratio: 0.1
+  # Random seed for reproducibility
+  random_seed: 42
+  # Batch size for DataLoader
+  batch_size: 64
+  # Number of DataLoader workers
+  num_workers: 4
+
+# Dataset-specific configurations
+datasets:
+  SMD:
+    n_features: 38
+    format: txt
+    source: OmniAnomaly
+  MSL:
+    n_features: 55
+    format: npy
+    source: telemanom
+  SMAP:
+    n_features: 25
+    format: npy
+    source: telemanom
+  PSM:
+    n_features: 25
+    format: csv
+    source: RANSynCoders

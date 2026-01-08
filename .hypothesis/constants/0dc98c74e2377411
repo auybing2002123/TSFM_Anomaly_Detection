@@ -1,0 +1,4 @@
+# file: E:\code\paper\code\TSFM_Anomaly_Detection\data\preprocessor.py
+# hypothesis_version: 6.150.0
+
+[1e-08, 100, '.npz', 'Preprocessor', 'is_fitted', 'mean', 'n_features', 'std', 'stride', 'window_size']
