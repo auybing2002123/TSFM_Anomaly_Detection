@@ -7,6 +7,10 @@ __pycache__/
 env/
 venv/
 .venv/
+.pytest_cache/
+.hypothesis/
+.coverage
+htmlcov/
 
 # Data
 data/datasets/
@@ -14,6 +18,12 @@ data/processed/
 *.npy
 *.npz
 *.parquet
+data/multi-source-data/
+data_gaia/
+data_msds/
+data_rcaeval/
+data_smd/
+datasets/
 
 # Model weights
 checkpoints/
@@ -26,6 +36,8 @@ logs/
 *.log
 wandb/
 runs/
+*.err
+*.out
 
 # Results
 results/
@@ -41,9 +53,23 @@ cache/
 *.swp
 *.swo
 
+# Secrets / local credentials
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+
 # OS
 .DS_Store
 Thumbs.db
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Project-local runtime / temp
+tmp/
+temp/

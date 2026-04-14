@@ -44,7 +44,7 @@ class AnomalyDataset(Dataset):
         
         Args:
             data: Window data of shape (N_windows, window_size, N_features).
-            labels: Optional labels of shape (N_windows,).
+            labels: Optional labels of shape (N_windows,) or (N_windows, window_size).
             mode: 'train' (no labels returned) or 'test' (labels returned).
         """
         # Convert to tensors if needed
@@ -58,8 +58,11 @@ class AnomalyDataset(Dataset):
                 self.labels = torch.LongTensor(labels)
             else:
                 self.labels = labels.long()
+            # Support both 1D (window-level) and 2D (point-level) labels
+            self._labels_are_pointwise = self.labels.ndim == 2
         else:
             self.labels = None
+            self._labels_are_pointwise = False
         
         # Validate mode
         if mode not in ['train', 'test']:
@@ -73,11 +76,18 @@ class AnomalyDataset(Dataset):
                 f"got {self.data.ndim}D"
             )
         
-        if self.labels is not None and len(self.labels) != len(self.data):
-            raise ValueError(
-                f"labels length ({len(self.labels)}) != "
-                f"data length ({len(self.data)})"
-            )
+        if self.labels is not None:
+            if self._labels_are_pointwise:
+                if self.labels.shape[0] != len(self.data):
+                    raise ValueError(
+                        f"labels first dim ({self.labels.shape[0]}) != "
+                        f"data length ({len(self.data)})"
+                    )
+            elif len(self.labels) != len(self.data):
+                raise ValueError(
+                    f"labels length ({len(self.labels)}) != "
+                    f"data length ({len(self.data)})"
+                )
     
     def __len__(self) -> int:
         """Return number of windows."""

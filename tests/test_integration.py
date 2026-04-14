@@ -60,7 +60,7 @@ class TestEndToEndPipeline:
         
         with patch.object(loader.downloader, 'download') as mock_download:
             with patch.object(loader._parsers['SMD'], 'parse') as mock_parse:
-                mock_download.return_value = Path('data/datasets/SMD')
+                mock_download.return_value = Path('datasets/SMD')
                 mock_parse.return_value = mock_data
                 
                 result = loader.load_dataset('SMD')
@@ -97,7 +97,7 @@ class TestEndToEndPipeline:
         
         with patch.object(loader.downloader, 'download') as mock_download:
             with patch.object(loader._parsers['SMD'], 'parse') as mock_parse:
-                mock_download.return_value = Path('data/datasets/SMD')
+                mock_download.return_value = Path('datasets/SMD')
                 mock_parse.return_value = mock_data
                 
                 result = loader.load_dataset('SMD')
@@ -158,7 +158,7 @@ class TestEndToEndPipeline:
             
             with patch.object(loader.downloader, 'download') as mock_download:
                 with patch.object(loader._parsers[name], 'parse') as mock_parse:
-                    mock_download.return_value = Path(f'data/datasets/{name}')
+                    mock_download.return_value = Path(f'datasets/{name}')
                     mock_parse.return_value = mock_data
                     
                     result = loader.load_dataset(name)
@@ -272,7 +272,7 @@ class TestConfigIntegration:
             f.write("""
 data:
   dataset_name: SMD
-  data_dir: data/datasets
+  data_dir: datasets
 
 preprocessing:
   window_size: 200
@@ -346,7 +346,7 @@ class TestErrorHandling:
         
         with patch.object(loader.downloader, 'download') as mock_download:
             with patch.object(loader._parsers['SMD'], 'parse') as mock_parse:
-                mock_download.return_value = Path('data/datasets/SMD')
+                mock_download.return_value = Path('datasets/SMD')
                 mock_parse.return_value = mock_data
                 
                 with pytest.raises(ValueError, match="window_size"):

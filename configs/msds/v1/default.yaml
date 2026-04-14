@@ -1,0 +1,37 @@
+# MSDS V1 默认配置
+
+# 数据配置
+data:
+  data_dir: "datasets/MSDS"
+  window: 10          # 时间窗口（秒）
+  step: 1             # 滑动步长（秒）
+  label_percent: 0.0  # unknown 标签百分比
+
+# 模型配置
+model:
+  metric_dim: 5       # Metric 特征维度
+  log_dim: 100        # Log 模板数（从数据中自动获取）
+  trace_dim: 10       # Trace 操作类型数（从数据中自动获取）
+  num_hosts: 5        # 主机数
+  embedding_dim: 768  # 嵌入维度
+  num_layers: 6       # Transformer 层数
+  num_heads: 12       # 注意力头数
+  dropout: 0.1        # Dropout
+
+# 训练配置
+training:
+  batch_size: 32
+  learning_rate: 1e-4
+  num_epochs: 50
+  label_weight: 0.5   # unknown 样本权重
+  cls_weight: 1.0     # 分类损失权重
+
+# 数据集划分
+split:
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+
+# 其他
+seed: 42
+device: "cuda"  # "cuda" 或 "cpu"

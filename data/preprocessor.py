@@ -60,9 +60,26 @@ class Preprocessor:
         if train_data.ndim != 2:
             raise ValueError(f"Expected 2D array, got {train_data.ndim}D")
         
+        mean = train_data.mean(axis=0)
+        std = train_data.std(axis=0)
+        
+        # 对于低方差特征（std 很小），设置 std=1 避免标准化后产生极端值
+        # 使用较大的阈值 0.01，因为即使 std=0.001 也会导致标准化后值放大 1000 倍
+        # 这样低方差特征标准化后仍然接近 0，不会产生极端值
+        MIN_STD = 0.01  # 提高阈值，避免小 std 导致的极端值
+        low_variance_features = std < MIN_STD
+        if low_variance_features.any():
+            n_low_var = low_variance_features.sum()
+            feature_indices = np.where(low_variance_features)[0]
+            logger.warning(
+                f"Found {n_low_var} low-variance features (std < {MIN_STD}): {feature_indices.tolist()}, "
+                f"setting their std to 1.0 to avoid extreme values after normalization"
+            )
+            std = np.where(std < MIN_STD, 1.0, std)
+        
         self.scaler_params = {
-            'mean': train_data.mean(axis=0),
-            'std': train_data.std(axis=0) + 1e-8  # Prevent division by zero
+            'mean': mean,
+            'std': std,
         }
         
         logger.info(
@@ -170,16 +187,16 @@ class Preprocessor:
             end = start + self.window_size
             windows[i] = data[start:end]
         
-        # Create point-level labels (last time point of each window)
+        # Create point-level labels for each window
         window_labels = None
         if labels is not None:
             if len(labels) != n_samples:
                 raise ValueError(
                     f"Labels length ({len(labels)}) != data length ({n_samples})"
                 )
-            # Point-level: use label of last time point in window
+            # Full window labels: shape (n_windows, window_size)
             window_labels = np.array([
-                labels[i * self.stride + self.window_size - 1]
+                labels[i * self.stride : i * self.stride + self.window_size]
                 for i in range(n_windows)
             ])
         

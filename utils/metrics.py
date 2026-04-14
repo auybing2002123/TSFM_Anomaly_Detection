@@ -136,12 +136,15 @@ def best_threshold_search(
     """
     Search for the best threshold to maximize a metric.
     
+    Uses thresholds from precision-recall curve for robust search across
+    any score distribution. This is the sklearn standard approach.
+    
     Args:
         y_true: Ground truth binary labels
         scores: Anomaly scores (higher = more anomalous)
         method: Metric to optimize ('f1', 'precision', 'recall')
         point_adjust: Whether to use point-adjusted metrics
-        n_thresholds: Number of thresholds to try
+        n_thresholds: Maximum number of thresholds to try
         
     Returns:
         Dict with best_threshold, best_score, and metrics at best threshold
@@ -149,13 +152,22 @@ def best_threshold_search(
     y_true = np.asarray(y_true).flatten()
     scores = np.asarray(scores).flatten()
     
-    # Generate thresholds
-    min_score, max_score = scores.min(), scores.max()
-    if min_score == max_score:
-        # All scores are the same
-        thresholds = [min_score]
-    else:
-        thresholds = np.linspace(min_score, max_score, n_thresholds)
+    # Use PR curve thresholds - these are actual score values that matter
+    # This handles skewed distributions much better than linspace
+    precision_arr, recall_arr, thresholds = precision_recall_curve(y_true, scores)
+    
+    # PR curve returns n+1 precision/recall values but n thresholds
+    # The last precision/recall is for threshold=max(scores)+eps (all negative)
+    # We only use the first n thresholds
+    if len(thresholds) == 0:
+        # Edge case: all same label
+        thresholds = np.array([scores.min()])
+    
+    # Limit number of thresholds to avoid slow computation
+    if len(thresholds) > n_thresholds:
+        # Sample thresholds uniformly
+        indices = np.linspace(0, len(thresholds) - 1, n_thresholds, dtype=int)
+        thresholds = thresholds[indices]
     
     best_threshold = thresholds[0]
     best_metric = 0.0
@@ -217,6 +229,22 @@ def compute_metrics(
     """
     y_true = np.asarray(y_true).flatten()
     scores = np.asarray(scores).flatten()
+    
+    # Handle NaN/Inf in scores - replace with median or 0
+    nan_mask = ~np.isfinite(scores)
+    if nan_mask.any():
+        n_invalid = nan_mask.sum()
+        import logging
+        logging.getLogger(__name__).warning(
+            f"Found {n_invalid} NaN/Inf values in scores ({n_invalid/len(scores)*100:.2f}%), "
+            "replacing with median"
+        )
+        valid_scores = scores[~nan_mask]
+        if len(valid_scores) > 0:
+            fill_value = np.median(valid_scores)
+        else:
+            fill_value = 0.0
+        scores = np.where(nan_mask, fill_value, scores)
     
     # Compute AUC metrics (threshold-independent)
     try:

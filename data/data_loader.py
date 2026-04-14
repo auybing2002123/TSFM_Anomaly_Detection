@@ -52,7 +52,7 @@ class TSFMADDataLoader:
     def __init__(
         self,
         config: Optional[Union[Dict, str, Path]] = None,
-        data_dir: str = 'data/datasets',
+        data_dir: str = 'datasets',
         processed_dir: str = 'data/processed'
     ):
         """
@@ -212,9 +212,18 @@ class TSFMADDataLoader:
         dataset_name: str,
         subset: Optional[str],
         val_ratio: float,
-        download: bool
+        download: bool,
+        save_processed: bool = True,
     ) -> Dict:
-        """Load and preprocess from raw data files."""
+        """Load and preprocess from raw data files.
+        
+        Args:
+            dataset_name: Name of dataset.
+            subset: Specific machine/entity, or None for all.
+            val_ratio: Validation set ratio.
+            download: Whether to download if not present.
+            save_processed: Whether to save processed data to disk for future use.
+        """
         
         # Step 1: Download if needed
         if download:
@@ -255,13 +264,23 @@ class TSFMADDataLoader:
             f"Created windows: train={train_windows.shape}, test={test_windows.shape}"
         )
         
-        # Step 5: Split validation set
-        train_windows, val_windows = self._split_validation(
+        # Step 5: Save processed data for future use (before val split)
+        if save_processed and subset is None:
+            self._save_processed(
+                dataset_name=dataset_name,
+                train_windows=train_windows,
+                test_windows=test_windows,
+                test_labels=test_labels,
+                raw_metadata=raw_data['metadata'],
+            )
+        
+        # Step 6: Split validation set
+        train_windows_split, val_windows = self._split_validation(
             train_windows, val_ratio
         )
         
-        # Step 6: Create datasets
-        train_dataset = AnomalyDataset(train_windows, mode='train')
+        # Step 7: Create datasets
+        train_dataset = AnomalyDataset(train_windows_split, mode='train')
         val_dataset = AnomalyDataset(val_windows, mode='train')
         test_dataset = AnomalyDataset(test_windows, test_labels, mode='test')
         
@@ -283,6 +302,50 @@ class TSFMADDataLoader:
             'metadata': metadata,
             'preprocessor': self.preprocessor,
         }
+    
+    def _save_processed(
+        self,
+        dataset_name: str,
+        train_windows: np.ndarray,
+        test_windows: np.ndarray,
+        test_labels: np.ndarray,
+        raw_metadata: Dict,
+    ) -> None:
+        """Save processed data to disk for future use."""
+        save_path = self.processed_dir / dataset_name
+        save_path.mkdir(parents=True, exist_ok=True)
+        
+        # Save arrays
+        np.save(save_path / 'train_windows.npy', train_windows)
+        np.save(save_path / 'test_windows.npy', test_windows)
+        np.save(save_path / 'test_labels.npy', test_labels)
+        
+        # Build metadata
+        metadata = {
+            'dataset': dataset_name,
+            'n_features': train_windows.shape[2],
+            'window_size': self.preprocessor.window_size,
+            'stride': self.preprocessor.stride,
+            'train_samples': len(train_windows),
+            'test_samples': len(test_windows),
+            'anomaly_ratio': float(test_labels.mean()),
+            'normalized': self.config.get('normalize', True),
+            'raw_train_len': raw_metadata.get('train_len', 0),
+            'raw_test_len': raw_metadata.get('test_len', 0),
+        }
+        
+        # Save scaler params if available
+        if self.preprocessor.scaler_params is not None:
+            metadata['scaler'] = {
+                'mean': self.preprocessor.scaler_params['mean'].tolist(),
+                'std': self.preprocessor.scaler_params['std'].tolist(),
+            }
+        
+        # Save metadata
+        with open(save_path / 'metadata.yaml', 'w') as f:
+            yaml.dump(metadata, f, default_flow_style=False)
+        
+        logger.info(f"Saved processed data to {save_path}")
     
     def _split_validation(
         self,

@@ -7,7 +7,7 @@ data:
   # Specific subset (machine/entity), null for all
   subset: null
   # Data storage directory
-  data_dir: data/datasets
+  data_dir: datasets
 
 preprocessing:
   # Sliding window size

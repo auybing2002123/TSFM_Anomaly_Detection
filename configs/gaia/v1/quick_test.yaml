@@ -1,0 +1,41 @@
+# V1 快速测试配置（用于验证代码）
+
+# 数据配置
+data:
+  data_path: data_gaia/processed/v1/quick_test.pt  # 快速测试数据
+  seq_len: 96
+  stride: 10                                        # 更大的步长，减少样本数
+  train_ratio: 0.7
+  val_ratio: 0.15
+
+# 模型配置
+model:
+  n_metrics: 20                 # 减少 metric 数量
+  log_features: 4
+  trace_features: 6
+  hidden_dim: 768
+  gpt_layers: 2                 # 只用 2 层，加快训练
+  freeze_gpt2: true
+  train_ln: true
+  train_wpe: true
+  head_hidden_dim: 256          # 减小检测头
+  dropout: 0.1
+  cache_dir: null
+
+# 训练配置
+training:
+  epochs: 5                     # 只训练 5 轮
+  batch_size: 8                 # 小批次
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-5
+  num_workers: 0
+  save_interval: 2
+  output_dir: checkpoints/gaia/v1/quick_test
+
+# 评估配置
+evaluation:
+  threshold: 0.5
+  metrics:
+    - precision
+    - recall
+    - f1

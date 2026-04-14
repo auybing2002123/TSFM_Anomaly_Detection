@@ -4,13 +4,40 @@
 
 ## 项目概述
 
-利用预训练的时序基础模型（Chronos/Moirai）进行少样本边缘异常检测，通过LoRA实现高效的参数微调。
+利用预训练的时序基础模型进行少样本边缘异常检测，通过参数高效微调实现高性能异常检测。
+
+## 最新实验结果 (2026-01-08)
+
+### GPT-2 Backbone (One Fits All 方法)
+
+在 SMD 数据集上的结果：
+
+| 方法 | F1 | Precision | Recall | AUC-ROC |
+|------|-----|-----------|--------|---------|
+| Chronos Frozen | 36.6% | 48.3% | 28.7% | 70.6% |
+| Chronos LoRA | 37.6% | 41.8% | 34.3% | 70.9% |
+| **GPT-2 (GPT4TS)** | **84.3%** | **87.0%** | **81.7%** | **70.9%** |
+
+**关键发现：**
+- GPT-2 backbone 显著优于 Chronos（F1 提升 47%）
+- 使用 point-level 评估 + point-adjustment（与 One Fits All 论文一致）
+- 仅训练 1.02% 参数（LayerNorm + Position Embeddings + Output Layer）
+
+### 运行 GPT-2 验证
+
+```bash
+# 快速验证（3 epochs）
+python scripts/run_gpt4ts_validation.py --dataset SMD --epochs 3 --threshold_method best_f1
+
+# 完整训练（10 epochs）
+python scripts/run_gpt4ts_validation.py --dataset SMD --epochs 10 --threshold_method best_f1
+```
 
 ## 核心创新
 
 1. **TSFM + 异常检测** - 系统化地将时序基础模型用于异常检测的可复现 pipeline
-2. **LoRA 微调** - 参数高效微调，验证在少样本场景下的收益
-3. **多任务异常检测头** - 融合重构和预测的异常分数，带可学习融合权重
+2. **参数高效微调** - 仅训练 1% 参数达到 SOTA 效果
+3. **多任务异常检测头** - 融合重构和预测的异常分数
 
 ## 评估协议说明
 

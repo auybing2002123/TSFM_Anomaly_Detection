@@ -1,0 +1,42 @@
+# V1 默认配置
+
+# 数据配置
+data:
+  data_path: data_gaia/processed/v1/train.pt  # 预处理数据路径（可用 --data-path 覆盖）
+  seq_len: 96                                  # 序列长度
+  stride: 1                                    # 滑动窗口步长
+  train_ratio: 0.7                             # 训练集比例
+  val_ratio: 0.15                              # 验证集比例（剩余为测试集）
+
+# 模型配置
+model:
+  n_metrics: 100                # Metric 特征数（会自动从数据中检测）
+  log_features: 4               # Log 统计特征数（固定）
+  trace_features: 6             # Trace 统计特征数（固定）
+  hidden_dim: 768               # GPT-2 隐藏维度
+  gpt_layers: 6                 # 使用的 GPT-2 层数
+  freeze_gpt2: true             # 是否冻结 GPT-2
+  train_ln: true                # 是否训练 LayerNorm
+  train_wpe: true               # 是否训练位置编码
+  head_hidden_dim: 384          # 检测头隐藏层维度
+  dropout: 0.1                  # Dropout 比例
+  cache_dir: null               # GPT-2 缓存目录（null 使用默认）
+
+# 训练配置
+training:
+  epochs: 50                    # 训练轮数
+  batch_size: 32                # 批次大小
+  learning_rate: 1.0e-4         # 学习率
+  weight_decay: 1.0e-5          # 权重衰减
+  num_workers: 0                # 数据加载线程数（Windows 建议设为 0）
+  save_interval: 10             # 保存检查点间隔
+  output_dir: checkpoints/gaia/v1  # 输出目录
+
+# 评估配置
+evaluation:
+  threshold: 0.5                # 异常检测阈值
+  metrics:
+    - precision
+    - recall
+    - f1
+    - auc

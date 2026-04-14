@@ -1,0 +1,49 @@
+# CausalFusion 因果多模态异常检测配置
+
+# 数据配置
+data:
+  dataset_dir: "datasets/GAIA/MicroSS"
+  time_window: "1min"
+  window_size: 32        # 小规模测试用 32，正式训练用 100
+  stride: 16             # 小规模测试用 16，正式训练用 1
+  train_ratio: 0.7
+  val_ratio: 0.1
+  test_ratio: 0.2
+
+# 模型配置 (维度会根据数据自动调整)
+model:
+  n_metrics: 50          # 默认值，会被数据集实际值覆盖
+  log_features: 4        # 默认值，会被数据集实际值覆盖
+  trace_features: 5      # 默认值，会被数据集实际值覆盖
+  hidden_dim: 768
+  n_modalities: 3
+  use_causal_attention: true
+  modality_dropout: 0.1
+  dropout: 0.1
+
+# GPT-2 配置
+gpt2:
+  model_name: "openai-community/gpt2"
+  cache_dir: "../../cache"
+  freeze: true
+
+# 训练配置
+training:
+  batch_size: 4          # 小规模测试用 4，正式训练用 8
+  learning_rate: 0.0001
+  epochs: 5              # 小规模测试用 5，正式训练用 20+
+  early_stopping_patience: 10
+  checkpoint_dir: "checkpoints/causal_multimodal"
+  weight_decay: 0.01
+
+# 评估配置
+evaluation:
+  threshold: 0.5
+  point_adjust: true
+  metrics: ["f1", "precision", "recall", "auc"]
+
+# 可视化配置
+visualization:
+  save_dir: "results/causal_multimodal"
+  plot_causal_matrix: true
+  plot_causal_graph: true

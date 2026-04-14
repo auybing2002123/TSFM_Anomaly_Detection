@@ -324,7 +324,7 @@ class TestLoadDatasetValidation:
         # Mock the download and parse to avoid actual I/O
         with patch.object(loader.downloader, 'download') as mock_download:
             with patch.object(loader._parsers['SMD'], 'parse') as mock_parse:
-                mock_download.return_value = Path('data/datasets/SMD')
+                mock_download.return_value = Path('datasets/SMD')
                 mock_parse.return_value = {
                     'train_data': np.random.randn(1000, 38),
                     'test_data': np.random.randn(500, 38),
@@ -359,7 +359,7 @@ class TestLoadDatasetIntegration:
         
         with patch.object(loader.downloader, 'download') as mock_download:
             with patch.object(loader._parsers['SMD'], 'parse') as mock_parse:
-                mock_download.return_value = Path('data/datasets/SMD')
+                mock_download.return_value = Path('datasets/SMD')
                 mock_parse.return_value = {
                     'train_data': mock_train,
                     'test_data': mock_test,
@@ -412,7 +412,7 @@ class TestLoadDatasetIntegration:
         
         with patch.object(loader.downloader, 'download') as mock_download:
             with patch.object(loader._parsers['SMD'], 'parse') as mock_parse:
-                mock_download.return_value = Path('data/datasets/SMD')
+                mock_download.return_value = Path('datasets/SMD')
                 mock_parse.return_value = {
                     'train_data': mock_train,
                     'test_data': np.random.randn(500, n_features),

@@ -97,7 +97,7 @@ class DatasetDownloader:
     
     def __init__(
         self,
-        base_dir: str = 'data/datasets',
+        base_dir: str = 'datasets',
         max_retries: int = 3,
         timeout: int = 30
     ):
