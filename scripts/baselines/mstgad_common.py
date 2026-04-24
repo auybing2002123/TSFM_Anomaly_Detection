@@ -122,6 +122,32 @@ def latest_result_dir() -> Optional[Path]:
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
+def resolve_result_dir(
+    checkpoint: Path | None = None,
+    result_dir: Path | None = None,
+) -> Path:
+    if result_dir is not None:
+        return Path(result_dir)
+    if checkpoint is not None:
+        return Path(checkpoint).parent
+    latest = latest_result_dir()
+    if latest is None:
+        raise FileNotFoundError("No MSTGAD result directory found.")
+    return latest
+
+
+def load_result_params(
+    checkpoint: Path | None = None,
+    result_dir: Path | None = None,
+) -> Dict[str, Any]:
+    resolved_dir = resolve_result_dir(checkpoint=checkpoint, result_dir=result_dir)
+    params_path = resolved_dir / "params.json"
+    if not params_path.exists():
+        raise FileNotFoundError(f"MSTGAD params.json not found: {params_path}")
+    with params_path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
 @dataclass
 class MSTGADRuntimeBundle:
     model: Any
@@ -201,7 +227,7 @@ def mstgad_args(
 def build_runtime_bundle(
     *,
     checkpoint: Path | None = None,
-    batch_size: int = 1,
+    batch_size: int | None = 1,
     device: str = "cuda",
     result_dir: Path | None = None,
 ) -> MSTGADRuntimeBundle:
@@ -212,19 +238,22 @@ def build_runtime_bundle(
     from util.data_MSDS import Process
     from src.model import MyModel
 
-    args = mstgad_args(batch_size=batch_size, gpu=device != "cpu")
+    resolved_result_dir = resolve_result_dir(checkpoint=checkpoint, result_dir=result_dir)
+    params = load_result_params(checkpoint=checkpoint, result_dir=resolved_result_dir)
+    args = mstgad_args(gpu=device != "cpu")
+    args.update(params)
+    if batch_size is not None:
+        args["batch_size"] = batch_size
+    args["gpu"] = device != "cpu"
     device_obj = torch.device(device)
     with _temporary_cwd(MSTGAD_ROOT):
         processed = Process(**args)
     model = MyModel(processed.graph, **args).to(device_obj)
 
     if checkpoint is None:
-        result_dir = latest_result_dir()
-        if result_dir is None:
-            raise FileNotFoundError("No MSTGAD result directory found.")
-        candidates = list(result_dir.glob("my_loss_stage.ckpt"))
+        candidates = list(resolved_result_dir.glob("my_loss_stage.ckpt"))
         if not candidates:
-            raise FileNotFoundError(f"Checkpoint not found under {result_dir}")
+            raise FileNotFoundError(f"Checkpoint not found under {resolved_result_dir}")
         checkpoint = candidates[0]
     checkpoint = Path(checkpoint)
     if not checkpoint.exists():
@@ -240,10 +269,11 @@ def build_runtime_bundle(
         graph=processed.graph,
         device=device_obj,
         checkpoint_path=checkpoint,
-        result_dir=result_dir or checkpoint.parent,
+        result_dir=resolved_result_dir,
         data_path=MSTGAD_PREPROCESSED,
         dataset_path=MSTGAD_SAVE,
         metadata={
+            "batch_size": args["batch_size"],
             "window": args["window"],
             "step": args["step"],
             "log_len": args["log_len"],

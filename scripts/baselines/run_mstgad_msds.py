@@ -31,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=5e-4)
     parser.add_argument("--weight-decay", type=float, default=5e-4)
     parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "results" / "baselines")
+    parser.add_argument("--skip-local-eval", action="store_true")
     return parser.parse_args()
 
 
@@ -117,6 +118,31 @@ def main() -> int:
         except Exception:
             pass
 
+    if not args.skip_local_eval:
+        eval_checkpoint = result_dir / "my_f1_stage.ckpt"
+        if not eval_checkpoint.exists():
+            eval_checkpoint = result_dir / "my_loss_stage.ckpt"
+        eval_cmd = [
+            str(args.python),
+            str(PROJECT_ROOT / "scripts" / "baselines" / "evaluate_mstgad_msds.py"),
+            "--checkpoint",
+            str(eval_checkpoint),
+            "--device",
+            "cuda",
+            "--output-dir",
+            str(run_dir),
+            "--tag",
+            "post_train",
+        ]
+        local_eval = run_command(eval_cmd, PROJECT_ROOT)
+        summary["local_eval_checkpoint"] = str(eval_checkpoint)
+        summary["local_eval_returncode"] = local_eval.returncode
+        summary["local_eval_stdout"] = local_eval.stdout
+        summary["local_eval_stderr"] = local_eval.stderr
+        (run_dir / "local_eval_stdout.txt").write_text(local_eval.stdout, encoding="utf-8")
+        (run_dir / "local_eval_stderr.txt").write_text(local_eval.stderr, encoding="utf-8")
+
+    save_json(run_dir / "summary.json", summary)
     print("MSTGAD baseline completed")
     print(f"Run dir   : {run_dir}")
     print(f"Result dir : {result_dir}")

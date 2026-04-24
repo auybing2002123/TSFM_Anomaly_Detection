@@ -22,6 +22,8 @@ data/multi-source-data/
 data_gaia/
 data_msds/
 data_rcaeval/
+data_eadro/processed/
+data_eadro/cache/
 data_smd/
 datasets/
 
@@ -41,6 +43,8 @@ runs/
 
 # Results
 results/
+artifacts/
+result/
 
 # Cache
 cache/

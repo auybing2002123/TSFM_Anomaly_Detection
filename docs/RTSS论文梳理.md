@@ -2,26 +2,12 @@
 
 ## 1. 当前定位
 
-- 投稿主线：`RTSS`
 - 问题定义：在**多模态异常检测**场景下，同时优化
   - 检测效果
   - deadline miss
   - tail latency
   - 推理路径稳定性
 - 当前最合适的主模型：`service-aware MoE (stage-2)`
-- 当前最重要的对照基线：`V6-3layer raw`
-- 当前不作为最终主线的方法：
-  - `RTSS-MoE P0/P1-sticky`
-  - `V6-cache`
-  - `V6-3+fallback-6`
-
-一句话版本：
-
-> 我们现在最适合讲的 RTSS 故事，不是“MoE 提高了 F1”，而是“在多模态 TSFM 主干上，用 service-aware sparse routing 把 deadline miss、tail latency 和 routing stability 做得更可控”。
-
----
-
-## 2. 模型架构
 
 ### 2.1 基础主干
 
@@ -54,43 +40,162 @@
 
 ### 2.3 论文架构图草案
 
-```mermaid
-flowchart LR
-    A[Metrics Window] --> B1[Metric Encoder]
-    C[Logs Window] --> B2[Log Encoder]
-    D[Trace / Call Graph Window] --> B3[Trace Graph Encoder]
+```text
+┌────────────────────────────────────────────────────────────────────────────┐
+│                       输入数据（每个时间窗口 / 每个服务）                    │
+│            Metrics（指标）   Logs（日志）   Traces（调用链/拓扑）            │
+└────────────────────────────────────────────────────────────────────────────┘
+                │              │                 │
+                ▼              ▼                 ▼
+        ┌────────────┐  ┌────────────┐  ┌─────────────────┐
+        │MetricEncoder│  │ LogEncoder │  │ TraceGraphEncoder│
+        │ 线性+归一化 │  │ 线性+归一化 │  │ GATv2 / no-graph │
+        └────────────┘  └────────────┘  └─────────────────┘
+                │              │                 │
+                └──────────────┴─────────┬───────┘
+                                         ▼
+                             ┌────────────────────┐
+                             │  Fusion Projection │
+                             │ 拼接后投影到 GPT-2 │
+                             └────────────────────┘
+                                         │
+                                         ▼
+                       每个服务的时间序列单独送入 GPT-2
+                                         │
+                                         ▼
+                    ┌────────────────────────────────────┐
+                    │  3-layer Frozen GPT-2 Backbone     │
+                    │  只在最后 1 层挂 MoE Adapter        │
+                    └────────────────────────────────────┘
+                                         │
+                                         ▼
+                    ┌────────────────────────────────────┐
+                    │ Service-aware Sparse MoE Adapter   │
+                    │ Router -> 4 experts 选 Top-2       │
+                    │ + service prior (cyclic / block)   │
+                    └────────────────────────────────────┘
+                          │                     │
+                          │                     └──────────────► Balance Loss
+                          │
+                          ▼
+                    GPT-2 用前 T-1 步预测第 T 步表示
+                          │
+               ┌──────────┴──────────┐
+               ▼                     ▼
+        Pred Head               Recon Head
+               │                (重构 metric + log)
+               ▼
+      deviation = pred_last - actual_last
+               │
+               ▼
+        Deviation Encoder
+               │
+        ┌──────┴───────────────┐
+        ▼                      ▼
+┌────────────────┐     ┌─────────────────────────────┐
+│Anomaly Classifier│     │ RCA Parallel Branch         │
+│ 正常 / 异常概率 │     │ root score / rootness /     │
+└────────────────┘     │ victimness / root ranking   │
+        │              └─────────────────────────────┘
+        ▼
+   异常概率输出
 
-    B1 --> E[Fusion Projection]
-    B2 --> E
-    B3 --> E
+──────────────────────────── 并行分析 / 后处理支路 ────────────────────────────
 
-    E --> F[3-layer Frozen GPT-2 Backbone]
-    G[Service Prior<br/>cyclic / block] --> H
-    F --> H[Last-layer Service-aware Sparse MoE Adapter<br/>4 experts, top-2, Q/V]
+MoE Router 输出
+    └──► Routing Diagnostics
+         - effective_experts
+         - route_switch_rate
+         - dominant_top1_share
 
-    H --> I[One-step Prediction Head]
-    I --> J[Prediction Deviation]
-    J --> K[Deviation Encoder]
-    K --> L[Anomaly Classifier]
+输入 / 融合表示 / deviation / anomaly score
+    └──► Explainability
+         - IG
+         - attribution
+         - modality / time / service importance
 
-    H --> M[Reconstruction Head]
-    N[Replay Runtime<br/>paced replay + prefetch/pin] -. evaluation .-> H
+──────────────────────────── 系统与评测层 ───────────────────────────────────
+
+Inference Runtime Wrapper
+    - paced replay
+    - prefetch
+    - pin_memory
+    - deadline check
+    - stress replay
+
+Runtime 输出指标
+    - miss@50/100/200ms
+    - mean / p95 / p99 / max latency
+    - peak memory
+
 ```
 
-### 2.4 画图时建议突出什么
+### 2.4 逐模块解释
 
-如果后面要正式出论文图，建议把颜色重点放在下面 4 个部件：
+#### 2.4.1 三路输入：Metrics / Logs / Traces
 
-1. `3-layer frozen GPT-2 backbone`
-2. `service-aware sparse MoE adapter`
-3. `fixed top-2 routing`
-4. `runtime replay / deadline evaluation`
+#### 2.4.2 三个编码器
 
-这样评审一眼就能看出：
+因为三种数据格式不一样，不能直接混在一起，所以要先分别做编码。
 
-- 你们不是重新发明整个 backbone
-- 你们的贡献集中在“**稳定、可预测的 sparse routing**”
-- 方法与 RTSS 指标是成体系绑定的
+- `MetricEncoder`：把指标变成模型能理解的向量
+- `LogEncoder`：把日志特征变成统一表示
+- `TraceGraphEncoder`：不仅看 trace 数值，还把图结构关系一起编码
+
+#### 2.4.3 融合层
+
+三路编码结果会拼接在一起，再映射到 GPT-2 需要的输入维度。
+
+#### 2.4.4 冻结 GPT-2 主干
+
+这里的 GPT-2 相当于一个已经见过很多模式的老专家。
+
+没有把它全部重训，而是尽量保留它已有的能力，只在它里面加少量可训练的适配模块。这么做有两个好处：
+
+- 训练成本更低
+- 更适合 realtime 场景
+
+#### 2.4.5 MoE
+
+MoE = Mixture of Experts，专家混合。
+
+不是所有输入都交给同一个小模块处理，而是让多个小专家分工合作。代码当前代表配置是：
+
+- `4` 个专家
+- 每次路由选 `Top-2`
+
+#### 2.4.6 Router
+
+Router 负责决定“当前这个样本更适合交给哪几个专家”。
+
+`Top-2` 的意思就是：
+
+> 每次主要找两个最相关的专家，而不是四个一起上。
+
+#### 2.4.7 Service-aware prior：先看它属于哪个服务，再分专家
+
+方法创新之一。
+
+普通 MoE 只根据“当前输入长什么样”来选专家。
+
+ `service-aware MoE` 还会额外利用“这个样本属于哪个服务”的信息，让不同服务更容易走向更合适的专家。
+
+这会带来两个好处：
+
+- 路由更稳定
+- 更符合系统里“不同服务有不同个性”的事实
+
+#### 2.4.8 预测偏差：先预测正常应该怎样，再判断有没有出问题
+
+把预测值和真实值相减，得到 `deviation`（偏差）。
+
+如果偏差很大，就说明现实和模型预期差很多，也就更像异常。
+
+#### 2.4.9 分类头：最后给出异常概率
+
+偏差本身只是一个线索，还需要经过进一步编码，再交给分类器输出正常/异常概率。
+
+
 
 ### 2.5 当前默认配置
 
@@ -135,7 +240,7 @@ L_total = L_MSTGAD + lambda_pred * L_pred + lambda_bal * L_bal
 - `latency-aware cost loss`
 - `switch / sticky loss`
 
-这两类更强 RTSS 约束，已经在 `RTSS-MoE P0/P1` 原型里做过骨架与探测，但**当前最终主结果不是靠它们收口**，而是靠 `service-aware sparse routing + runtime co-design` 收口。正文里要诚实区分这一点。
+这两类更强 RTSS 约束，已经在 `RTSS-MoE P0/P1` 原型里做过骨架与探测，但**当前最终主结果不是靠它们收口**，而是靠 `service-aware sparse routing + runtime co-design` 收口。
 
 ---
 
@@ -145,31 +250,16 @@ L_total = L_MSTGAD + lambda_pred * L_pred + lambda_bal * L_bal
 
 | 级别 | 创新点 | 核心意思 | 当前证据 |
 |------|--------|----------|----------|
-| 主 | `service-aware sparse routing` | 在多模态 TSFM 上引入带服务先验的固定预算 MoE 路由，不再是完全自由路由 | `no-service-prior`、`strength`、`cyclic/block` 消融都已完成 |
-| 主 | `deadline / stability-oriented evaluation protocol` | 不只看 `F1`，还系统报告 `miss@deadline`、`p99/max`、stress replay、routing diagnostics | 双数据集 replay、多 seed、统一 deadline stress 已完成 |
-| 主 | `routing stability as first-class evidence` | 用 `effective_experts / route_switch_rate / dominant_top1_share` 描述路径稳定性 | 已有 routing diagnostics 和多 seed 汇总 |
+| 主 | `service-aware sparse routing`和3-layer backbone | 在多模态 TSFM 上引入带服务先验的固定预算 MoE 路由，不再是完全自由路由。用更轻的时序主干作为 RTSS 参考骨架，降低最坏时延与显存 | `no-service-prior`、`strength`、`cyclic/block` 消融都已完成。`6-layer raw vs 3-layer raw` 对比已完成 |
+| 主 | 在尽可能的保证精度的情况下的实时性 | 不只看 `F1`，还系统报告 `miss@deadline`、`p99/max`、stress replay、routing diagnostics | 双数据集 replay、多 seed、统一 deadline stress 已完成 |
+| 主 | Service-aware MoE | 不是普通 MoE，而是让不同服务更倾向于不同专家 | 已有消融实验和多 seed 汇总 |
 
 ### 3.2 次创新点
 
 | 级别 | 创新点 | 核心意思 | 当前证据 |
 |------|--------|----------|----------|
-| 次 | `3-layer backbone` | 用更轻的时序主干作为 RTSS 参考骨架，降低最坏时延与显存 | `6-layer raw vs 3-layer raw` 对比已完成 |
-| 次 | `runtime co-design` | 通过 `prefetch / pin_memory / paced replay` 识别并压掉 runtime 侧瓶颈 | `no prefetch / prefetch / prefetch+pin` 消融已完成 |
-| 次 | `multi-modal tradeoff analysis` | 不把“多模态都 equally important”讲满，而是分析各模态与图结构对实时性的影响 | `w/o metrics/logs/traces` 与图结构消融已完成 |
-
-### 3.3 当前最稳妥的论文表述
-
-建议正文把创新点收束成下面这句：
-
-> 我们提出一种面向实时异常检测的 `service-aware sparse routing` 机制，在轻量化 TSFM 主干中显式约束专家选择路径，并结合 deadline-oriented replay 与 routing diagnostics，提升多模态模型的推理可预测性与尾部稳定性。
-
-不要写成：
-
-- “我们提出了全新的通用 MoE 框架”
-- “我们给出严格 timing guarantee”
-- “所有模态都同等关键”
-
-这些说法目前都偏过。
+| 次 | `解释性输出` | 用更轻的时序主干作为 RTSS 参考骨架，降低最坏时延与显存 | `6-layer raw vs 3-layer raw` 对比已完成 |
+| 次 | 多模态与大模型 | 大模型的通用知识能力 |  |
 
 ---
 
@@ -181,10 +271,10 @@ L_total = L_MSTGAD + lambda_pred * L_pred + lambda_bal * L_bal
 | `Precision` | 预测异常中真正异常的比例 | 越高越好 | 辅助说明误报情况 |
 | `Recall` | 真实异常被检出的比例 | 越高越好 | 辅助说明漏报情况 |
 | `Accuracy` | 总体分类正确率 | 越高越好 | 辅助指标 |
-| `miss@50/100/200ms` | 响应时间超过 deadline 的比例 | 越低越好 | RTSS 主指标 |
+| `miss@50/100/200ms` | 响应时间超过 deadline 的比例。`miss@100ms`：超过 100ms deadline 的比例，越低越好，最好是 0 | 越低越好 | RTSS 主指标 |
 | `mean latency` | 平均响应时延 | 越低越好 | 补充总体开销 |
-| `p95 / p99 / p99.9` | 高分位尾延迟 | 越低越好 | RTSS 核心稳定性指标 |
-| `max latency` | 最坏样本响应时延 | 越低越好 | 最坏情况证据 |
+| `p95 / p99 / p99.9` | 高分位尾延迟。`p99`：最慢的那 1% 大概有多慢，越低说明越稳 | 越低越好 | RTSS 核心稳定性指标 |
+| `max latency` | 最坏样本响应时延。最坏情况下有多慢 | 越低越好 | 最坏情况证据 |
 | `peak memory` | 峰值显存/内存 | 越低越好 | 部署代价指标 |
 | `effective_experts` | 路由实际使用到的有效专家数 | 适中更好 | 看是否塌缩或过度集中 |
 | `route_switch_rate` | 相邻窗口切换 expert 的频率 | 越低越稳 | 路由稳定性指标 |
@@ -198,28 +288,23 @@ L_total = L_MSTGAD + lambda_pred * L_pred + lambda_bal * L_bal
 - `max`
 - `route_switch_rate`
 
-其余指标可以放附录或补充材料。
-
 ---
 
 ## 5. 已完成实验总览
 
 ### 5.1 主线实验
+| 方法 | 数据集 | Offline F1 | Replay miss | Replay p99 | Replay max | 怎么理解 |
+|---|---|---:|---:|---:|---:|---|
+| `V6 raw (6-layer)` | MSDS | `0.9403` | `0.2%` | `37.07ms` | `311.56ms` | 很准，但最坏情况不稳 |
+| `V6 raw (6-layer)` | RE2-TT | `0.8974` | `14.0%` | `189.19ms` | `201.56ms` | 跨数据集能跑，但在线经常来不及 |
+| `V6-3layer raw` | MSDS | `0.9242~0.9358` | `0.2%` | `40.29ms` | `161.95ms` | 更轻、更稳、显存更低 |
+| `V6-3layer raw` | RE2-TT | `0.8669~0.9079` | `6.0%~59.0%` | `115.07ms`（代表点） | `124.01ms`（代表点） | 离线还行，但实时波动很大 |
+| `MoE-adapter-light` | MSDS | `0.9446` | `0.0%` | `60.64ms` | `73.20ms` | 说明“专家分工”这条路是通的 |
+| `MoE-adapter-light` | RE2-TT | `0.9114` | `0.0%` | `88.25ms` | `97.35ms` | 比 3-layer raw 更像实时可用方案 |
+| `Service-aware MoE (stage-2)` | MSDS | `0.9259` | `0.0%` | `47.05ms` | `103.95ms` | 在 MSDS 上也闭环成功 |
+| `Service-aware MoE (stage-2)` | RE2-TT | `0.9048` | `0.0%` | `42.83ms` | `44.08ms` | 当前最亮眼的主结果之一 |
 
-| 类别 | 实验 | 数据集 | 关键结果 | 当前定位 |
-|------|------|--------|----------|----------|
-| backbone | `V6 raw (6-layer)` | `MSDS` | `F1=0.9403`，replay `miss@100ms=0.2%`，`p99=37.07ms`，但 `max=311.56ms` | 原始参考 |
-| backbone | `V6 current reference (6-layer)` | `RE2-TT` | replay `miss@100ms=14.0%`，`p99=189.19ms` | 旧主线参考 |
-| backbone | `V6-3layer raw` | `MSDS` | `seed42: F1=0.9343`，replay `miss@100ms=0.2%`，`p99=40.29ms`，`peak memory=251.80MB` | 当前 deployment / raw 对照主线 |
-| backbone | `V6-3layer raw` | `RE2-TT` | `seed42: F1=0.9079`，replay `miss@100ms=6.0%`，`p99=115.07ms` | 当前 deployment / raw 对照主线 |
-| lightweight probe | `V6-4layer` | `MSDS` | `mean=19.16ms, p99=38.62ms`，但离线效果明显下降 | 负结果保留 |
-| routing fallback | `V6-3+fallback-6` | `MSDS/RE2-TT` | 离线可涨点，但 replay 明显退化，`RE2-TT miss@100ms=71.0%` | 负结果保留 |
-| early MoE | `MoE-adapter-light` | `MSDS` | `F1=0.9446`，`miss@100ms=0.0%`，`p99=60.64ms` | 创新支线前身 |
-| early MoE | `MoE-adapter-light` | `RE2-TT` | `F1=0.9114`，`miss@100ms=0.0%`，`p99=88.25ms` | 说明 MoE 方向成立 |
-| RTSS prototype | `RTSS-MoE P0/P0.1` | `MSDS` | `prefetch+pin` 后可降到 `miss@100ms=0.2%`，但还没全面超过主线 | 证明 runtime 侧瓶颈真实存在 |
-| RTSS prototype | `RTSS-MoE P0/P1 sticky` | `RE2-TT` | 正式 replay 仍不稳，`P1 sticky` 未成立 | 不进最终主线 |
-| current RTSS mainline | `service-aware MoE (stage-2)` | `MSDS` | `F1=0.9259`；标准 replay `miss@1000ms=0.0%`，`p99=47.05ms`；统一 `100ms` stress 下仍 `0.0% miss` | 当前 RTSS 主候选 |
-| current RTSS mainline | `service-aware MoE (stage-2)` | `RE2-TT` | `F1=0.9048`，replay `miss@100ms=0.0%`，`p99=42.83ms`，`max=44.08ms` | 当前最强 RTSS 主结果 |
+`service-aware MoE` 不一定在所有数据集上拿到最高 `F1`，但它在**deadline miss、tail latency、最坏情况**上形成了更好的时序性
 
 ### 5.2 多 seed / 稳定性实验
 
@@ -227,8 +312,8 @@ L_total = L_MSTGAD + lambda_pred * L_pred + lambda_bal * L_bal
 |------|--------|------|----------|
 | `V6-3layer raw multi-seed` | `MSDS` | `F1=0.9242 ~ 0.9358` | 离线较稳 |
 | `V6-3layer raw multi-seed` | `RE2-TT` | `F1=0.8669 ~ 0.9079`，`miss@100ms=6.0% ~ 59.0%` | seed 敏感明显 |
-| `service-aware MoE multi-seed` | `MSDS` | `F1=0.9276 ± 0.0018`，`miss=0.0% ± 0.0%`，`p99=48.22 ± 1.16ms` | offline / replay 都稳 |
-| `service-aware MoE multi-seed` | `RE2-TT` | `F1=0.8888 ± 0.0124`，`miss=0.0% ± 0.0%`，`p99=49.24 ± 4.55ms` | replay 稳，offline 有波动 |
+| `service-aware MoE multi-seed` | `MSDS` | `F1=0.9278 ± 0.0014`，`miss=0.0% ± 0.0%`，`p99=59.22 ± 20.88ms` | offline 很稳，replay 全部 `0 miss`，但有一组较慢 seed |
+| `service-aware MoE multi-seed` | `RE2-TT` | `F1=0.8888 ± 0.0124`，`miss=0.0% ± 0.0%`，`p99=51.38 ± 1.55ms` | replay 稳，offline 有波动 |
 
 ### 5.3 统一 deadline / stress replay
 
@@ -239,40 +324,17 @@ L_total = L_MSTGAD + lambda_pred * L_pred + lambda_bal * L_bal
 
 ### 5.4 外部 baseline
 
-| baseline | 数据集 | 关键结果 | 当前定位 |
-|----------|--------|----------|----------|
-| `TranAD` | `MSDS` | `F1=0.8966`；统一 deadline stress 下 `miss@100ms=0.0%`，`p99≈23.79~24.83ms` | 当前最强外部 RTSS baseline |
-| `Anomaly Transformer` | `MSDS` | `F1=0.6250`；统一 replay `miss@100ms=0.0%`，`p99=27.64ms` | RTSS 实时补充对照 |
+| 方法 | 数据集 | 关键结果 | 怎么理解 |
+|---|---|---|---|
+| `TranAD` | MSDS | `F1=0.8966, P=0.9999, R=0.8126, AUC=0.9062` | 公开异常检测 baseline，离线效果不错 |
+| `Anomaly Transformer` | MSDS | `F1=0.6250, P=0.4545, R=1.0000` | 已复现，但准确率明显弱于你们 |
+| `TranAD` stress replay | MSDS | 不同 interval 下都 `miss@100ms=0.0%`, `p99≈23.79~24.83ms` | 很强的轻量级 RTSS baseline |
+| `Anomaly Transformer` replay | MSDS | `miss@100ms=0.0%`, `p99=27.64ms`, `max=28.76ms` | 很快，但离线检测效果弱 |
+| `Service-aware MoE` | MSDS / RE2-TT | 多 seed `0% miss`，同时保持不错 F1 | 复杂模型也能稳定实时运行 |
 
----
+## 6. 消融实验
 
-## 6. 当前最值得放进正文的主结果快照
-
-说明：
-
-- `MSDS` 上，`service-aware MoE` 的 RTSS 结论最好用**统一 `100ms` deadline stress**来讲
-- `RE2-TT` 上，标准 paced replay 已经足够说明问题
-
-| 模型 | 数据集 | Offline F1 | Replay / Stress 口径 | miss@100ms | p99 | max | 当前判断 |
-|------|--------|-----------:|----------------------|-----------:|----:|----:|----------|
-| `V6-3layer raw` | `MSDS` | 0.9343 | paced replay | 0.2% | 40.29 ms | 161.95 ms | 原始强对照，最坏情况较差 |
-| `MoE-adapter-light` | `MSDS` | 0.9446 | paced replay | 0.0% | 60.64 ms | 73.20 ms | 零 miss，但整体尾部不如当前主线整洁 |
-| `service-aware MoE` | `MSDS` | 0.9259 | unified stress (`deadline=100ms`) | 0.0% | 39.47~43.79 ms | 41.28~66.11 ms | RTSS 证据更完整 |
-| `V6-3layer raw` | `RE2-TT` | 0.9079 | paced replay | 6.0% | 115.07 ms | 124.01 ms | deployment 对照 |
-| `MoE-adapter-light` | `RE2-TT` | 0.9114 | paced replay | 0.0% | 88.25 ms | 97.35 ms | MoE 方向早期亮点 |
-| `service-aware MoE` | `RE2-TT` | 0.9048 | paced replay | 0.0% | 42.83 ms | 44.08 ms | 当前 RTSS 主结果 |
-
-这张表最适合支撑的结论是：
-
-- `service-aware MoE` 不一定在所有数据集上拿到最高 `F1`
-- 但它在**deadline miss、tail latency、最坏情况**上形成了更好的 RTSS tradeoff
-- 因此适合作为 RTSS 主线，而 `V6-3layer raw` 继续作为 deployment / accuracy 对照线
-
----
-
-## 7. 已完成消融实验
-
-### 7.1 核心 RTSS 消融
+### 6.1 核心 RTSS 消融
 
 | 消融 | 数据集 | 代表结果 | 结论 |
 |------|--------|----------|------|
@@ -287,85 +349,24 @@ L_total = L_MSTGAD + lambda_pred * L_pred + lambda_bal * L_bal
 | `runtime: no prefetch / prefetch / prefetch+pin` | `RE2-TT` | `prefetch` 基本够用，`pin` 增益有限 | I/O 瓶颈真实存在 |
 | `runtime: no prefetch / prefetch / prefetch+pin` | `MSDS` | 只有 `prefetch+pin` 最稳 | runtime 处理要和数据集绑定分析 |
 
-### 7.2 附录级模态 / 图结构消融
+### 6.2 附录级模态 / 图结构消融
 
-| 消融 | 数据集 | 代表结果 | 结论 |
-|------|--------|----------|------|
-| `w/o metrics` | `MSDS` | `F1=0.9407` | `metrics` 边际影响最小 |
-| `w/o logs` | `MSDS` | `F1=0.7436` | `logs` 是 MSDS 最关键模态 |
-| `w/o traces` | `MSDS` | `F1=0.9304` | traces 有增益，但不是最主导 |
-| `trace no-graph encoder` | `MSDS` | `F1=0.9025` | 图结构建模有价值 |
-| `dense adjacency` | `MSDS` | `F1=0.9446`，replay 也很强 | `MSDS` 上图结构影响更复杂 |
-| `w/o metrics` | `RE2-TT` | `F1=0.9051`，`miss=0.0%` | metrics 去掉后影响不大 |
-| `w/o logs` | `RE2-TT` | `F1=0.9248`，但 `miss@100ms=1.0%` | logs 对 RTSS 稳定性有帮助 |
-| `w/o traces` | `RE2-TT` | `F1=0.9152`，`p99=51.77ms` | traces 更影响时序稳定 tradeoff |
-| `trace no-graph encoder` | `RE2-TT` | `p99=45.12ms` | 简化图建模在 RE2-TT 上反而更稳 |
-| `dense adjacency` | `RE2-TT` | `F1=0.9261`，但 `miss@100ms=3.0%`，`p99=132.19ms` | 不能只看离线效果 |
-
-### 7.3 当前可讲出的附录结论
+| 变体 | 数据集 | F1 | Replay miss | Replay p99 | 怎么理解 |
+|---|---|---:|---:|---:|---|
+| `w/o metrics` | MSDS | `0.9407` | `0.0%` | `61.36ms` | 去掉指标影响不算最大 |
+| `w/o logs` | MSDS | `0.7436` | `0.0%` | `80.39ms` | 去掉日志后明显崩掉 |
+| `w/o traces` | MSDS | `0.9304` | `0.0%` | `62.33ms` | traces 有用，但没 logs 那么关键 |
+| `w/o metrics` | RE2-TT | `0.9051` | `0.0%` | `58.21ms` | 指标去掉影响有限 |
+| `w/o logs` | RE2-TT | `0.9248` | `1.0%` | `89.44ms` | 离线还行，但实时明显变差 |
+| `w/o traces` | RE2-TT | `0.9152` | `0.0%` | `51.77ms` | traces 更体现结构与稳定性作用 |
 
 - `MSDS` 更依赖 `logs`
-- `RE2-TT` 更体现图结构与 realtime tradeoff
-- 因此正文不能写成“多模态都同等关键”
-- 更稳妥的表述是：
-  - `logs` 是主导模态之一
-  - `traces / graph` 提供结构性补充
-  - 不同数据集上，模态价值与实时性 tradeoff 不同
+- `RE2-TT` 更体现图结构与 实时性
 
----
+  `logs` 是主导模态之一，`traces / graph` 提供结构性补充不同数据集上，模态价值与实时性 tradeoff 不同
 
-## 8. 论文里建议怎么摆表
 
-### 8.1 主文建议
 
-| 编号 | 内容 | 建议 |
-|------|------|------|
-| Fig.1 | 方法总架构图 | 用上面的架构图草案 |
-| Table 1 | 双数据集主结果表 | `V6-3layer raw / MoE-adapter-light / service-aware MoE`，再加外部 baseline |
-| Table 2 | 多 seed 稳定性表 | 重点放 `service-aware MoE`，`V6-3layer raw` 作为对照 |
-| Table 3 | 统一 deadline / stress replay | 体现 RTSS 风格核心贡献 |
-| Table 4 | 核心 RTSS 消融 | `no prior`、`top1/top2`、`strength`、`cyclic/block`、runtime |
+不是“每个模态都必不可少”，而是证明“不同模态和图结构在不同数据集上承担的作用不同，而且这种作用不仅体现在离线 F1，还体现在实时稳定性上”。
 
-### 8.2 附录建议
-
-| 编号 | 内容 | 建议 |
-|------|------|------|
-| Appendix A | 模态 / 图结构消融 | `w/o metrics/logs/traces`、`no_graph`、`dense adjacency` |
-| Appendix B | 负结果保留 | `RTSS-MoE P0/P1-sticky`、`fallback-6`、`cache` |
-| Appendix C | 更完整 routing diagnostics | `effective_experts`、`switch_rate`、`dominant_top1_share` |
-| Appendix D | 更长 replay / 更多 interval | 如果版面允许可补 |
-
----
-
-## 9. 当前还需要最后对齐的点
-
-下面这些不是“大缺口”，但如果要按 RTSS 风格写得更硬，建议最后整理时补齐：
-
-1. 统一主表口径  
-   当前 `service-aware MoE` 已有统一 `100ms` deadline stress，`TranAD / Anomaly Transformer` 也已有统一 replay；如果要让主表最干净，`V6 raw / V6-3layer raw` 最好也补成同口径 stress 表。
-
-2. 统计检验  
-   现在已有 `mean/std`，但如果要更稳，可进一步补：
-   - 置信区间
-   - 显著性检验或 effect size
-
-3. 论文表述边界  
-   当前更适合说：
-   - “empirically more stable”
-   - “better deadline/tail-latency tradeoff”
-   
-   不适合直接说：
-   - “hard real-time guarantee”
-   - “strictly optimal routing”
-
----
-
-## 10. 当前一句话结论
-
-如果现在就按 RTSS 写，最合理的结构是：
-
-- `V6-3layer raw` 作为轻量原始对照线
-- `service-aware MoE` 作为主方法
-- 用 `multi-seed + unified deadline stress + routing diagnostics + core ablations` 支撑“稳定、可预测、deadline-aware 的多模态推理”这个主故事
-
-这条线已经比单纯讲 `MoE 提升 F1` 强得多，也更贴近 RTSS 的评审口味。
+在一个多模态、带 service-aware routing 的复杂模型里，把 deadline miss 和 tail latency 控住了。
