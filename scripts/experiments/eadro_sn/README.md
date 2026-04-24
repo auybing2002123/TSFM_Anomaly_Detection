@@ -26,6 +26,19 @@
 - `online_v6_eadro_replay_runner.py`
   - `Eadro-SN` 隔离版 realtime replay 入口
   - 自动按 checkpoint 的图结构配置加载，避免训练/回放配置不一致
+- `train_service_aware_moe_eadro_sn.py`
+  - `Eadro-SN` 隔离版 `service-aware MoE` 训练入口
+  - 复用 `moe_stage2` 的 `service-aware sparse routing`
+  - 默认按 `anomaly-label + window_anomaly` 主口径启动
+  - 保持和当前 `Eadro-SN V6` 一样的 lazy loader / 低内存设置
+- `online_service_aware_moe_eadro_runner.py`
+  - `Eadro-SN` 隔离版 `service-aware MoE` realtime replay 入口
+  - 自动从训练 summary/diagnostic 中恢复 `window_anomaly threshold`
+  - 输出和当前 `V6` replay 对齐的 realtime 指标
+- `analyze_service_aware_moe_routing_eadro.py`
+  - `Eadro-SN` 的 MoE routing diagnostics
+  - 输出 `effective_experts / dominant_top1_share / route_switch_rate`
+  - 并按 `normal / root / affected / anomaly` 统计专家偏好
 
 ## 推荐用法
 
@@ -40,9 +53,9 @@
 
 ## 下一步
 
-- 在这里接 `3-layer raw` 的最小训练入口
-- 再接 `service-aware MoE` 的 Eadro-SN 训练入口
-- 所有脚本都优先复用 `data_eadro/`，不回写既有数据管线
+- 先跑 `service-aware MoE` 的 smoke / seed=42 正式训练
+- 再补 `routing diagnostics + replay`
+- 如果结果成立，再继续做 `w/o logs / w/o metrics / w/o traces`
 
 ## 训练示例
 
@@ -101,4 +114,37 @@
   scripts/experiments/eadro_sn/eval_eadro_sn_checkpoint.py `
   --checkpoint checkpoints/eadro/experiments/v6_3layer_anomaly_label_eadro_sn_s42/best_model.pth `
   --output-json results/experiments/eadro_sn/v6_3layer_anomaly_label_eadro_sn_s42/diagnostic_eval.json
+```
+
+## service-aware MoE 示例
+
+```powershell
+& 'D:\anaconda\envs\paper_env\python.exe' `
+  scripts/experiments/eadro_sn/train_service_aware_moe_eadro_sn.py `
+  --data-dir data_eadro/processed/sn_lazy `
+  --label-mode anomaly `
+  --selection-target window_anomaly `
+  --epochs 12 `
+  --batch-size 4 `
+  --grad-accum-steps 4 `
+  --seed 42
+```
+
+```powershell
+& 'D:\anaconda\envs\paper_env\python.exe' `
+  scripts/experiments/eadro_sn/analyze_service_aware_moe_routing_eadro.py `
+  --checkpoint checkpoints/eadro/experiments/moe_stage2/service_aware_eadro_sn_s42_bs4ga4/best_model.pth `
+  --split test
+```
+
+```powershell
+& 'D:\anaconda\envs\paper_env\python.exe' `
+  scripts/experiments/eadro_sn/online_service_aware_moe_eadro_runner.py `
+  --checkpoint checkpoints/eadro/experiments/moe_stage2/service_aware_eadro_sn_s42_bs4ga4/best_model.pth `
+  --split test `
+  --pace `
+  --prefetch `
+  --pin-memory `
+  --interval-ms 100 `
+  --deadline-ms 100
 ```

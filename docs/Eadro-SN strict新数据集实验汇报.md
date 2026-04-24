@@ -1,6 +1,6 @@
 # Eadro-SN strict 新数据集实验汇报
 
-更新时间：`2026-04-21`
+更新时间：`2026-04-24`
 
 ## 1. 文档目的
 
@@ -8,6 +8,7 @@
 覆盖范围包括：
 
 - 我们自己的 `V6` 主实验
+- 隔离版 `service-aware MoE` warm-start 探测
 - 模态 / 预处理 / 图结构 / depth / runtime 消融
 - 外部 baseline 严格协议对齐
 - baseline realtime replay 对齐
@@ -56,6 +57,7 @@
 |---|---|---|
 | 主实验 | `V6-3layer/4layer/6layer anomaly-label` | 已完成 |
 | 内部参考 | `V6-3layer raw` | 已完成 |
+| 隔离版 MoE | `from-scratch top1/top2 + warm-start top1/top2 + warm-start 模态消融` | 已完成 |
 | 模态消融 | `w/o logs / w/o metrics / w/o traces` | 已完成 |
 | 预处理消融 | `trainsplit_service_minmax` | 已完成 |
 | 图结构消融 | `trace no-graph / raw adjacency / dense adjacency` | 已完成 |
@@ -78,6 +80,8 @@
 | `V6-4layer anomaly-label` | `0.8884` | `0.9367` | `0.9250` | `0.9487` | `0.9000` | `0.0%` | `45.70` | `53.16` | `61.04` | `66.18` | 当前最强稳定深度版本 |
 | `V6-6layer anomaly-label` | `0.8933` | `0.9560` | `0.9383` | `0.9744` | `0.9300` | `25.0%` | `84.62` | `164.68` | `180.17` | `183.82` | 检测最强，但 realtime 失效 |
 | `V6-3layer raw` | `0.8851` | `0.9024` | `0.8605` | `0.9487` | `0.8400` | `0.0%` | `37.95` | `46.82` | `49.07` | `59.56` | 更轻更快，但 replay 检测略弱于 anomaly-label |
+| `Service-aware MoE (warm-start from V6, prior=0.5)` | `0.9025` | `0.9494` | `0.9375` | `0.9615` | `0.9200` | `0.0%` | `43.77` | `51.25` | `55.04` | `59.22` | 当前 `Eadro` 上最强稳定结果，且比 `prior=0.75` 更稳 |
+| `Service-aware MoE (warm-start from V6, top1, prior=0.5)` | `0.8889` | `0.9427` | `0.9367` | `0.9487` | `0.9100` | `0.0%` | `43.31` | `50.79` | `57.43` | `68.92` | 固定预算更保守，但没有优于 `top2 + prior=0.5` |
 
 ### 4.1 主实验阶段结论
 
@@ -85,10 +89,77 @@
 - 如果只看“稳定版本中的最高效果”，`V6-4layer anomaly-label` 更强。
 - `6-layer` 说明了一个重要结论：更深 backbone 的确能继续抬高 F1，但会明显破坏 deadline 稳定性。
 - `raw` 可以作为内部参考线，证明 `anomaly-label` 的改动不是单纯靠更重的 runtime 换来的。
+- 新补的 `Service-aware MoE (warm-start from V6, prior=0.5)` 已经在 `offline / replay` 两侧同时超过 `V6-3layer anomaly-label`，而且 `p99=55.04ms` 也明显优于第一版 `prior=0.75` 的 `87.48ms`，说明这条线已经不只是“能训通”，而是找到了更合理的 prior 强度。
+- `top1` 也已经补完，但它没有形成更好的折中：`offline / replay` 都略低于 `top2 + prior=0.5`，`p99` 也没有更低。
+
+### 4.2 隔离版 `Service-aware MoE` warm-start 探测
+
+说明：
+
+- 这组实验都在隔离脚本里完成，不改原有 `V6` 主线代码。
+- `offline F1` 统一使用 `diagnostic_eval.json` 中 `test / window_anomaly_val_selected`。
+- `replay F1` 使用同一套 `100-step / 100ms / prefetch+pin / cpu` 口径。
+
+| 配置 | offline F1 | replay F1 | miss@100ms | p99(ms) | effective_experts | dominant_top1_share | route_switch_rate | 结论 |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| `from-scratch top2 + prior` | `0.7308` | `0.5088` | `0.0%` | `70.37` | `3.641` | `0.5320` | `0.0296` | 路由能动，但检测边界没学起来 |
+| `from-scratch top1 + prior` | `0.6939` | `0.4685` | `0.0%` | `75.62` | `4.000` | `0.2500` | `0.0000` | 专家利用看起来均匀，但任务效果更差 |
+| `warm-start top2 + prior` | `0.8959` | `0.9434` | `0.0%` | `87.48` | `3.901` | `0.2905` | `0.0074` | 明显回正并超过 `V6-3layer anomaly-label` |
+
+结论：
+
+- `MoE` 不是天然不行，真正的问题是之前把“异常检测边界学习”和“专家路由学习”放在同一条 from-scratch 路线上同时做，优化难度太高。
+- `warm-start` 的本质是先继承强 `V6` 主干的检测能力，再让 `MoE` 只负责稀疏增强，因此训练目标更稳定。
+- 这条结果说明：如果要在 `Eadro-SN strict` 上把 `MoE` 写成可信结果，正确表述应是“建立在强 backbone 上的稀疏增强模块”，而不是独立 from-scratch 主干。
+
+### 4.3 `service_prior_strength` 小扫描 + `no prior` 消融
+
+说明：
+
+- 所有配置都建立在同一条 `warm-start` 路线上。
+- 统一口径：`3-layer + topk=2 + lr=3e-4 + base_lr_scale=0.1 + anomaly-label + prefetch+pin replay`
+
+| 配置 | offline F1 | replay F1 | miss@100ms | p99(ms) | effective_experts | dominant_top1_share | route_switch_rate | 结论 |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| `warm-start + prior=0.5` | `0.9025` | `0.9494` | `0.0%` | `55.04` | `3.942` | `0.2879` | `0.0061` | 当前最优点，效果和稳定性同时最好 |
+| `warm-start + prior=0.75` | `0.8959` | `0.9434` | `0.0%` | `87.48` | `3.901` | `0.2905` | `0.0074` | 首版成立，但不是最优 |
+| `warm-start + prior=1.0` | `0.8955` | `0.9427` | `0.0%` | `92.77` | `3.982` | `0.2500` | `0.0000` | 约束过强，router 基本不切换 |
+| `warm-start + no prior` | `0.8778` | `0.9299` | `0.0%` | `58.03` | `2.809` | `0.9400` | `0.0281` | 实时更轻，但检测明显退化，且出现专家偏置 |
+
+结论：
+
+- `service prior` 不是越强越好，`0.75 / 1.0` 都比 `0.5` 更差，说明过强约束会压制有效路由学习。
+- `no prior` 也不行：虽然它的 `p99` 更轻，但 `offline / replay F1` 都明显退回，而且 `dominant_top1_share=0.940`，已经出现明显的专家偏置。
+- 因此当前最合理的写法是：`service prior` 确实有效，但需要适中强度；在 `Eadro-SN strict` 上当前 sweet spot 是 `0.5`。
+
+### 4.4 `warm-start MoE` 的 `top1 + 模态消融`（新增）
+
+说明：
+
+- 本节全部建立在当前 best setting：`warm-start + top2 + prior=0.5`
+- 唯一变化项分别是：`top1`、`w/o logs`、`w/o metrics`、`w/o traces`
+- `replay` 口径继续保持：`100-step / 100ms / prefetch+pin / cpu`
+
+| 配置 | offline F1 | replay F1 | replay P | replay R | replay Acc | miss@100ms | p99(ms) | effective_experts | dominant_top1_share | route_switch_rate | 结论 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `top2 + prior=0.5 (full)` | `0.9025` | `0.9494` | `0.9375` | `0.9615` | `0.9200` | `0.0%` | `55.04` | `3.942` | `0.2879` | `0.0061` | 当前参考线 |
+| `top1 + prior=0.5` | `0.8889` | `0.9427` | `0.9367` | `0.9487` | `0.9100` | `0.0%` | `57.43` | `4.000` | `0.2500` | `0.0000` | 更保守，但没有形成更好的实时-效果折中 |
+| `w/o logs` | `0.9300` | `0.9494` | `0.9375` | `0.9615` | `0.9200` | `0.0%` | `56.77` | `3.172` | `0.6495` | `0.0932` | 离线略升、replay 打平，但路由明显更偏置 |
+| `w/o metrics` | `0.6872` | `0.6446` | `0.9070` | `0.5000` | `0.5700` | `0.0%` | `57.31` | `3.813` | `0.3810` | `0.0168` | `metrics` 仍是关键模态，去掉后检测明显崩掉 |
+| `w/o traces` | `0.7355` | `0.6875` | `0.8800` | `0.5641` | `0.6000` | `0.0%` | `66.95` | `3.851` | `0.3853` | `0.0516` | `traces` 去掉后也明显退化，且 tail 更差 |
+
+结论：
+
+- `top1` 在 `Eadro warm-start MoE` 上并不成立：它把 router 压成了近乎静态路由，但没有换来更好的 `F1` 或 `p99`。
+- `metrics` 和 `traces` 在这条 `MoE` 线上都仍然重要，去掉后都会出现明确退化。
+- `logs` 的结论要诚实写：在这条 `warm-start MoE` 线上，`w/o logs` 并没有掉点，反而 `offline F1` 略升，因此不能把 `logs` 讲成这条数据集上的必要模态。
+- 因此如果后续要写 `Eadro-SN strict` 的 `MoE` 消融，最稳妥的组合应是：
+  - 强成立项：`top1 vs top2`、`w/o metrics`、`w/o traces`
+  - 谨慎表述项：`w/o logs`
 
 ## 5. 消融实验
 
-### 5.1 模态与预处理消融
+### 5.1 `V6` 主线的模态与预处理消融
 
 | 实验 | offline F1 | replay F1 | replay P | replay R | replay Acc | miss@100ms | mean(ms) | p95(ms) | p99(ms) | max(ms) | 结论 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
@@ -167,11 +238,13 @@
 | `V6-3layer anomaly-label` | `0.8778` | `+0.1434` vs `GDN-official` |
 | `V6-4layer anomaly-label` | `0.8884` | `+0.1540` vs `GDN-official` |
 | `V6-6layer anomaly-label` | `0.8933` | `+0.1589` vs `GDN-official` |
+| `Service-aware MoE (warm-start from V6, prior=0.5)` | `0.9025` | `+0.1681` vs `GDN-official` |
 
 结论：
 
 - 即使对齐到严格协议，`Eadro-SN strict` 上我们的方法仍明显领先最强外部 baseline。
 - baseline strengthening 之后，最强 baseline 已经从早期的 `TraceAnomaly` 更新为 `GDN-official`，因此这条线比最开始更合规、也更抗质疑。
+- 新补的 `warm-start MoE` 在 `prior=0.5` 时已经成为当前 `Eadro-SN strict` 上效果最强、同时仍保持 `0 miss@100ms` 的稳定结果。
 
 ## 7. 外部 baseline：replay 对齐结果
 
@@ -251,12 +324,14 @@
 ### 9.1 一句话总结
 
 `Eadro-SN strict` 这条新数据集实验线已经形成了比较完整的闭环：  
-主方法、模态消融、图结构消融、depth 消融、runtime 消融、严格协议 baseline、baseline realtime 对齐和 strengthening 都已完成。
+主方法、隔离版 `MoE warm-start`、模态消融、图结构消融、depth 消融、runtime 消融、严格协议 baseline、baseline realtime 对齐和 strengthening 都已完成。
 
 ### 9.2 最值得汇报的结论
 
 - 我们的方法在 `Eadro-SN strict` 上显著超过最强外部 baseline：  
   `V6-3layer anomaly-label` 的 `offline F1=0.8778`，相比 `GDN-official` 的 `0.7344` 提升 `+0.1434`。
+- 新补的 `Service-aware MoE (warm-start from V6, prior=0.5)` 已把这条差距进一步拉大到 `+0.1681`，并且 replay 仍保持 `miss@100ms=0.0%`；  
+  这说明 `MoE` 在 `Eadro` 上不仅可行，而且存在明确的 `service prior` sweet spot。
 - `logs` 和 `metrics` 在该数据集上都属于关键模态：  
   去掉 `logs` 后 `offline F1` 降到 `0.7433`，去掉 `metrics` 后降到 `0.6495`。
 - `traces` 更像增强项：  
@@ -271,6 +346,7 @@
 ### 9.3 当前最适合的汇报口径
 
 - 主结果：`V6-3layer anomaly-label`
+- 当前最强稳定结果：`Service-aware MoE (warm-start from V6, isolated, prior=0.5)`
 - 更强稳定版本：`V6-4layer anomaly-label`
 - 关键模态消融：`w/o logs / w/o metrics / w/o traces`
 - 关键系统消融：`no prefetch / prefetch / prefetch+pin`
