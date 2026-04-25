@@ -62,8 +62,8 @@
 | 预处理消融 | `trainsplit_service_minmax` | 已完成 |
 | 图结构消融 | `trace no-graph / raw adjacency / dense adjacency` | 已完成 |
 | runtime 消融 | `no prefetch / prefetch / prefetch+pin` | 已完成 |
-| 外部 baseline | `GDN-official / GDN-style / TraceAnomaly / TranAD / Anomaly Transformer` | 已完成 |
-| baseline replay | 上述五条 baseline 的 resident replay | 已完成 |
+| 外部 baseline | `XGBoost+RBF-SVM score ensemble / RBF-SVM ensemble / GDN-official / GDN-style / TraceAnomaly / TranAD / Anomaly Transformer` | 已完成 |
+| baseline replay | 上述六条 baseline 的 resident replay | 已完成 |
 | baseline strengthening | `TranAD/AT` 超参补强、ensemble、`GDN` strengthening、`MTAD-GAT`、`DeepTraLog` feasibility | 已完成 |
 
 ## 4. 我们的方法：主实验与内部对照
@@ -80,7 +80,8 @@
 | `V6-4layer anomaly-label` | `0.8884` | `0.9367` | `0.9250` | `0.9487` | `0.9000` | `0.0%` | `45.70` | `53.16` | `61.04` | `66.18` | 当前最强稳定深度版本 |
 | `V6-6layer anomaly-label` | `0.8933` | `0.9560` | `0.9383` | `0.9744` | `0.9300` | `25.0%` | `84.62` | `164.68` | `180.17` | `183.82` | 检测最强，但 realtime 失效 |
 | `V6-3layer raw` | `0.8851` | `0.9024` | `0.8605` | `0.9487` | `0.8400` | `0.0%` | `37.95` | `46.82` | `49.07` | `59.56` | 更轻更快，但 replay 检测略弱于 anomaly-label |
-| `Service-aware MoE (warm-start from V6, prior=0.5)` | `0.9025` | `0.9494` | `0.9375` | `0.9615` | `0.9200` | `0.0%` | `43.77` | `51.25` | `55.04` | `59.22` | 当前 `Eadro` 上最强稳定结果，且比 `prior=0.75` 更稳 |
+| `Service-aware MoE (warm-start, prior=0.6, w/o logs)` | `0.9327` | `0.9494` | `0.9375` | `0.9615` | `0.9200` | `0.0%` | `54.20` | `65.98` | `69.80` | `75.47` | 当前 `Eadro` 上最强 realtime-stable F1 版本，已超过外部 slow ensemble |
+| `Service-aware MoE (warm-start from V6, prior=0.5)` | `0.9025` | `0.9494` | `0.9375` | `0.9615` | `0.9200` | `0.0%` | `43.77` | `51.25` | `55.04` | `59.22` | full-modality 稳定参考线，且比 `prior=0.75` 更稳 |
 | `Service-aware MoE (warm-start from V6, top1, prior=0.5)` | `0.8889` | `0.9427` | `0.9367` | `0.9487` | `0.9100` | `0.0%` | `43.31` | `50.79` | `57.43` | `68.92` | 固定预算更保守，但没有优于 `top2 + prior=0.5` |
 
 ### 4.1 主实验阶段结论
@@ -89,7 +90,7 @@
 - 如果只看“稳定版本中的最高效果”，`V6-4layer anomaly-label` 更强。
 - `6-layer` 说明了一个重要结论：更深 backbone 的确能继续抬高 F1，但会明显破坏 deadline 稳定性。
 - `raw` 可以作为内部参考线，证明 `anomaly-label` 的改动不是单纯靠更重的 runtime 换来的。
-- 新补的 `Service-aware MoE (warm-start from V6, prior=0.5)` 已经在 `offline / replay` 两侧同时超过 `V6-3layer anomaly-label`，而且 `p99=55.04ms` 也明显优于第一版 `prior=0.75` 的 `87.48ms`，说明这条线已经不只是“能训通”，而是找到了更合理的 prior 强度。
+- 新补的 `Service-aware MoE (warm-start, prior=0.6, w/o logs)` 已经把 offline F1 推到 `0.9327`，同时 replay 仍保持 `miss@100ms=0.0%`；full-modality 的 `prior=0.5` 则是更保守的稳定参考线。
 - `top1` 也已经补完，但它没有形成更好的折中：`offline / replay` 都略低于 `top2 + prior=0.5`，`p99` 也没有更低。
 
 ### 4.2 隔离版 `Service-aware MoE` warm-start 探测
@@ -121,22 +122,23 @@
 
 | 配置 | offline F1 | replay F1 | miss@100ms | p99(ms) | effective_experts | dominant_top1_share | route_switch_rate | 结论 |
 |---|---:|---:|---:|---:|---:|---:|---:|---|
-| `warm-start + prior=0.5` | `0.9025` | `0.9494` | `0.0%` | `55.04` | `3.942` | `0.2879` | `0.0061` | 当前最优点，效果和稳定性同时最好 |
+| `warm-start + prior=0.6 + w/o logs` | `0.9327` | `0.9494` | `0.0%` | `69.80` | `3.197` | `0.6037` | `0.0745` | 当前 F1 冲高版，实时性仍成立 |
+| `warm-start + prior=0.5` | `0.9025` | `0.9494` | `0.0%` | `55.04` | `3.942` | `0.2879` | `0.0061` | full-modality 稳定参考线 |
 | `warm-start + prior=0.75` | `0.8959` | `0.9434` | `0.0%` | `87.48` | `3.901` | `0.2905` | `0.0074` | 首版成立，但不是最优 |
 | `warm-start + prior=1.0` | `0.8955` | `0.9427` | `0.0%` | `92.77` | `3.982` | `0.2500` | `0.0000` | 约束过强，router 基本不切换 |
 | `warm-start + no prior` | `0.8778` | `0.9299` | `0.0%` | `58.03` | `2.809` | `0.9400` | `0.0281` | 实时更轻，但检测明显退化，且出现专家偏置 |
 
 结论：
 
-- `service prior` 不是越强越好，`0.75 / 1.0` 都比 `0.5` 更差，说明过强约束会压制有效路由学习。
+- full-modality 下 `service prior` 不是越强越好，`0.75 / 1.0` 都比 `0.5` 更差，说明过强约束会压制有效路由学习。
 - `no prior` 也不行：虽然它的 `p99` 更轻，但 `offline / replay F1` 都明显退回，而且 `dominant_top1_share=0.940`，已经出现明显的专家偏置。
-- 因此当前最合理的写法是：`service prior` 确实有效，但需要适中强度；在 `Eadro-SN strict` 上当前 sweet spot 是 `0.5`。
+- 在 F1 冲高目标下，`prior=0.6 + w/o logs` 是当前更好的 realtime-stable 候选：比 `prior=0.5 full` 高 `+0.0302` F1，同时保持 `0 miss@100ms`。
 
 ### 4.4 `warm-start MoE` 的 `top1 + 模态消融`（新增）
 
 说明：
 
-- 本节全部建立在当前 best setting：`warm-start + top2 + prior=0.5`
+- 本节从 full-modality 稳定参考线 `warm-start + top2 + prior=0.5` 出发，并补充当前 F1 冲高版 `prior=0.6 + w/o logs`
 - 唯一变化项分别是：`top1`、`w/o logs`、`w/o metrics`、`w/o traces`
 - `replay` 口径继续保持：`100-step / 100ms / prefetch+pin / cpu`
 
@@ -144,7 +146,8 @@
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
 | `top2 + prior=0.5 (full)` | `0.9025` | `0.9494` | `0.9375` | `0.9615` | `0.9200` | `0.0%` | `55.04` | `3.942` | `0.2879` | `0.0061` | 当前参考线 |
 | `top1 + prior=0.5` | `0.8889` | `0.9427` | `0.9367` | `0.9487` | `0.9100` | `0.0%` | `57.43` | `4.000` | `0.2500` | `0.0000` | 更保守，但没有形成更好的实时-效果折中 |
-| `w/o logs` | `0.9300` | `0.9494` | `0.9375` | `0.9615` | `0.9200` | `0.0%` | `56.77` | `3.172` | `0.6495` | `0.0932` | 离线略升、replay 打平，但路由明显更偏置 |
+| `w/o logs, prior=0.6` | `0.9327` | `0.9494` | `0.9375` | `0.9615` | `0.9200` | `0.0%` | `69.80` | `3.197` | `0.6037` | `0.0745` | 当前 F1 冲高版，实时性仍成立 |
+| `w/o logs, prior=0.5` | `0.9300` | `0.9494` | `0.9375` | `0.9615` | `0.9200` | `0.0%` | `56.77` | `3.172` | `0.6495` | `0.0932` | 离线略升、replay 打平，但路由明显更偏置 |
 | `w/o metrics` | `0.6872` | `0.6446` | `0.9070` | `0.5000` | `0.5700` | `0.0%` | `57.31` | `3.813` | `0.3810` | `0.0168` | `metrics` 仍是关键模态，去掉后检测明显崩掉 |
 | `w/o traces` | `0.7355` | `0.6875` | `0.8800` | `0.5641` | `0.6000` | `0.0%` | `66.95` | `3.851` | `0.3853` | `0.0516` | `traces` 去掉后也明显退化，且 tail 更差 |
 
@@ -152,7 +155,7 @@
 
 - `top1` 在 `Eadro warm-start MoE` 上并不成立：它把 router 压成了近乎静态路由，但没有换来更好的 `F1` 或 `p99`。
 - `metrics` 和 `traces` 在这条 `MoE` 线上都仍然重要，去掉后都会出现明确退化。
-- `logs` 的结论要诚实写：在这条 `warm-start MoE` 线上，`w/o logs` 并没有掉点，反而 `offline F1` 略升，因此不能把 `logs` 讲成这条数据集上的必要模态。
+- `logs` 的结论要诚实写：在这条 `warm-start MoE` 线上，`w/o logs` 并没有掉点，`prior=0.6` 还把 `offline F1` 推到 `0.9327`，因此不能把 `logs` 讲成这条数据集上的必要模态。
 - 因此如果后续要写 `Eadro-SN strict` 的 `MoE` 消融，最稳妥的组合应是：
   - 强成立项：`top1 vs top2`、`w/o metrics`、`w/o traces`
   - 谨慎表述项：`w/o logs`
@@ -225,26 +228,35 @@
 
 | 排名 | 方法 | 最优表示 / 配置 | Val F1 | Test F1 | Precision | Recall | Accuracy | 结论 |
 |---|---|---|---:|---:|---:|---:|---:|---|
-| 1 | `GDN-official` | `logs + window=5 + minmax + 1 epoch` | `0.7399` | `0.7344` | `0.8343` | `0.6558` | `0.8204` | 当前最强 official strict baseline |
-| 2 | `GDN-style` | `logs + window=10 + minmax + 3 epochs` | `0.7389` | `0.7196` | `0.8344` | `0.6326` | `0.8134` | 当前最强 isolated style baseline |
-| 3 | `TraceAnomaly` | `traces aggregate` | `0.7733` | `0.6930` | `0.6556` | `0.7349` | `0.7535` | 当前最强非 GDN 类 baseline |
-| 4 | `TranAD` | `logs-only` | `0.6108` | `0.6821` | `0.7600` | `0.6186` | `0.7817` | 最优形态是 logs-only，而不是 full |
-| 5 | `Anomaly Transformer` | `traces + max` | `0.5506` | `0.5537` | `0.3835` | `0.9953` | `0.3926` | 能跑通，但整体较弱 |
+| 1 | `XGBoost + RBF-SVM score ensemble` | `rank, 0.67 * XGBoost(metrics+logs+traces) + 0.33 * RBF-SVM-64(all)` | `0.9255` | `0.9075` | `0.8619` | `0.9581` | `0.9261` | 当前最强外部高精度 baseline，但实时性明显失效 |
+| 2 | `XGBoost` | `metrics+logs+traces, 500 trees, depth=3` | `0.9045` | `0.9007` | - | - | - | 纯离线精度很强且推理快；作为额外 probe 保留，主表需谨慎解释其监督协议 |
+| 3 | `RBF-SVM ensemble` | `64-member bagged RBF-SVM, metrics+logs+traces+trace_binary` | `0.8879` | `0.8589` | `0.7753` | `0.9628` | `0.8803` | 强精度型外部 slow component，单独也明显强于 GDN |
+| 4 | `GDN-official` | `logs + window=5 + minmax + 1 epoch` | `0.7399` | `0.7344` | `0.8343` | `0.6558` | `0.8204` | 当前最强 train-normal-only official strict baseline |
+| 5 | `GDN-style` | `logs + window=10 + minmax + 3 epochs` | `0.7389` | `0.7196` | `0.8344` | `0.6326` | `0.8134` | 当前最强 isolated style baseline |
+| 6 | `TraceAnomaly` | `traces aggregate` | `0.7733` | `0.6930` | `0.6556` | `0.7349` | `0.7535` | 当前最强非 GDN 类 train-normal-only baseline |
+| 7 | `TranAD` | `logs-only` | `0.6108` | `0.6821` | `0.7600` | `0.6186` | `0.7817` | 最优形态是 logs-only，而不是 full |
+| 8 | `Anomaly Transformer` | `traces + max` | `0.5506` | `0.5537` | `0.3835` | `0.9953` | `0.3926` | 能跑通，但整体较弱 |
+
+说明：
+
+- `XGBoost + RBF-SVM score ensemble` 使用监督 train split 训练，是为了补齐“强精度但高推理代价”的外部对手；`GDN / TraceAnomaly / TranAD / AT` 仍保留为 train-normal-only TSAD baseline。
+- 因此主文中建议把 `XGBoost + RBF-SVM score ensemble` 标为 `external high-accuracy / slow baseline`，把 `GDN-official` 标为 `strongest train-normal-only baseline`。
 
 ### 6.2 我们方法与最强 baseline 对比
 
 | 方法 | offline F1 | 与最强 baseline 的差值 |
 |---|---:|---:|
-| `V6-3layer anomaly-label` | `0.8778` | `+0.1434` vs `GDN-official` |
-| `V6-4layer anomaly-label` | `0.8884` | `+0.1540` vs `GDN-official` |
-| `V6-6layer anomaly-label` | `0.8933` | `+0.1589` vs `GDN-official` |
-| `Service-aware MoE (warm-start from V6, prior=0.5)` | `0.9025` | `+0.1681` vs `GDN-official` |
+| `V6-3layer anomaly-label` | `0.8778` | `-0.0297` vs external score ensemble; `+0.1434` vs `GDN-official` |
+| `V6-4layer anomaly-label` | `0.8884` | `-0.0191` vs external score ensemble; `+0.1540` vs `GDN-official` |
+| `V6-6layer anomaly-label` | `0.8933` | `-0.0142` vs external score ensemble; `+0.1589` vs `GDN-official` |
+| `Service-aware MoE (warm-start from V6, prior=0.5)` | `0.9025` | `-0.0050` vs external score ensemble; `+0.1681` vs `GDN-official` |
+| `Service-aware MoE (warm-start, prior=0.6, w/o logs)` | `0.9327` | `+0.0252` vs external score ensemble; `+0.1983` vs `GDN-official` |
 
 结论：
 
-- 即使对齐到严格协议，`Eadro-SN strict` 上我们的方法仍明显领先最强外部 baseline。
-- baseline strengthening 之后，最强 baseline 已经从早期的 `TraceAnomaly` 更新为 `GDN-official`，因此这条线比最开始更合规、也更抗质疑。
-- 新补的 `warm-start MoE` 在 `prior=0.5` 时已经成为当前 `Eadro-SN strict` 上效果最强、同时仍保持 `0 miss@100ms` 的稳定结果。
+- 新增 `XGBoost + RBF-SVM score ensemble` 后，外部 baseline 不再只有“快但弱”的形态；它能把 `Test F1` 推到 `0.9075`，但实时性明显不合格。
+- 对 train-normal-only TSAD baseline 而言，最强 baseline 仍是 `GDN-official`，因此这条线比最开始更合规、也更抗质疑。
+- 新补的 `warm-start MoE prior=0.6 w/o logs` 已经在保持 `0 miss@100ms` 的同时超过外部 score ensemble；`prior=0.5 full` 仍可作为 full-modality 稳定参考线。
 
 ## 7. 外部 baseline：replay 对齐结果
 
@@ -255,6 +267,8 @@
 
 | 方法 | 离线 Test F1 | replay F1 | replay P | replay R | replay Acc | miss@100ms | mean(ms) | p95(ms) | p99(ms) | max(ms) | 结论 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `XGBoost + RBF-SVM score ensemble` | `0.9075` | `0.9024` | `0.8605` | `0.9487` | `0.8400` | `96.0%` | `1078.62` | `2196.86` | `2242.23` | `2274.14` | 当前最强外部高精度 ensemble，但顺序运行 XGBoost + kernel SVM 后 deadline 基本失效 |
+| `RBF-SVM ensemble` | `0.8589` | `0.8671` | `0.7895` | `0.9615` | `0.7700` | `100.0%` | `808.10` | `1154.91` | `1167.25` | `1174.65` | 外部 slow component，单独也明显强于 GDN |
 | `GDN-official strict adapter` | `0.7344` | `0.7259` | `0.8596` | `0.6282` | `0.6300` | `0.0%` | `12.46` | `19.54` | `19.93` | `20.88` | 当前最强 official strict baseline，realtime 很轻 |
 | `GDN-style strict adapter` | `0.7196` | `0.7519` | `0.9091` | `0.6410` | `0.6700` | `0.0%` | `10.92` | `19.24` | `22.95` | `26.22` | 当前最轻的 isolated style baseline |
 | `TraceAnomaly strict adapter` | `0.6930` | `0.8263` | `0.7753` | `0.8846` | `0.7100` | `0.0%` | `15.72` | `21.27` | `22.71` | `22.97` | 官方 TF1 resident replay 已补齐 |
@@ -263,9 +277,9 @@
 
 结论：
 
-- 五条 baseline 都能稳定满足 `100ms deadline`。
-- 因此在 `Eadro-SN strict` 上，核心竞争点不是“能不能跑进 deadline”，而是谁的检测能力更强。
-- 对 RTSS 写法来说，这个数据集更适合讲“准确率差异”和“深度/图结构导致的实时稳定性差异”，而不是讲 baseline realtime 压力。
+- 原五条 train-normal-only baseline 都能稳定满足 `100ms deadline`，但检测能力明显偏弱。
+- 新增 `XGBoost + RBF-SVM score ensemble` 补上了另一个极端：离线检测能力略高于当前最强 realtime-stable 自有模型，但顺序 kernel ensemble 推理无法满足 `100ms` deadline。
+- 对 RTSS 写法来说，这组结果更完整：外部 baseline 覆盖了“快但弱”和“强但慢”两端，而我们的方法强调在强检测能力和实时稳定性之间取得更好的折中。
 
 ## 8. baseline strengthening 与额外 probe
 
@@ -328,12 +342,12 @@
 
 ### 9.2 最值得汇报的结论
 
-- 我们的方法在 `Eadro-SN strict` 上显著超过最强外部 baseline：  
+- 我们的方法在 `Eadro-SN strict` 上显著超过最强 train-normal-only 外部 baseline：  
   `V6-3layer anomaly-label` 的 `offline F1=0.8778`，相比 `GDN-official` 的 `0.7344` 提升 `+0.1434`。
-- 新补的 `Service-aware MoE (warm-start from V6, prior=0.5)` 已把这条差距进一步拉大到 `+0.1681`，并且 replay 仍保持 `miss@100ms=0.0%`；  
-  这说明 `MoE` 在 `Eadro` 上不仅可行，而且存在明确的 `service prior` sweet spot。
-- `logs` 和 `metrics` 在该数据集上都属于关键模态：  
-  去掉 `logs` 后 `offline F1` 降到 `0.7433`，去掉 `metrics` 后降到 `0.6495`。
+- 新补的 `Service-aware MoE (warm-start, prior=0.6, w/o logs)` 已把这条差距进一步拉大到 `+0.1983`，并且 replay 仍保持 `miss@100ms=0.0%`；  
+  这说明 `MoE` 在 `Eadro` 上不仅可行，而且可以在实时约束内继续冲高 F1。
+- `metrics` 在该数据集上仍是关键模态；`logs` 的作用要分层写：  
+  V6 主线去掉 `logs` 会掉到 `offline F1=0.7433`，但 warm-start MoE 上 `w/o logs` 反而成为当前 F1 冲高版。
 - `traces` 更像增强项：  
   去掉 `traces` 后仍有 `offline F1=0.8439`、`replay F1=0.9277`。
 - `depth` 明确呈现“精度提升 vs deadline 失稳”的 tradeoff：  
@@ -341,17 +355,19 @@
 - `runtime` 优化是必须的：  
   同一个模型从 `no prefetch` 到 `prefetch+pin`，`miss@100ms` 从 `6.0%` 下降到 `0.0%`。
 - 外部 baseline 已做过 strengthening：  
-  `GDN-official / GDN-style / TraceAnomaly / TranAD / AT / MTAD-GAT / DeepTraLog` 都做过探测或正式复现，因此这条线具备较好的公平性说明基础。
+  `XGBoost / RBF-SVM ensemble / GDN-official / GDN-style / TraceAnomaly / TranAD / AT / MTAD-GAT / DeepTraLog` 都做过探测或正式复现，因此这条线具备较好的公平性说明基础。
 
 ### 9.3 当前最适合的汇报口径
 
 - 主结果：`V6-3layer anomaly-label`
-- 当前最强稳定结果：`Service-aware MoE (warm-start from V6, isolated, prior=0.5)`
+- 当前最强 realtime-stable F1 结果：`Service-aware MoE (warm-start, prior=0.6, w/o logs)`
+- full-modality 稳定参考线：`Service-aware MoE (warm-start from V6, isolated, prior=0.5)`
 - 更强稳定版本：`V6-4layer anomaly-label`
 - 关键模态消融：`w/o logs / w/o metrics / w/o traces`
 - 关键系统消融：`no prefetch / prefetch / prefetch+pin`
 - 关键结构消融：`3-layer / 4-layer / 6-layer`
-- strongest baseline：`GDN-official logs-only`
+- strongest train-normal-only baseline：`GDN-official logs-only`
+- external high-accuracy / slow baseline：`XGBoost + RBF-SVM score ensemble`
 
 ## 10. 结果来源
 
@@ -359,6 +375,11 @@
 - [进度文档](E:/code/paper/code/TSFM_Anomaly_Detection/docs/进度文档.md)
 - [Eadro strict replay summary](E:/code/paper/code/TSFM_Anomaly_Detection/results/baselines/eadro_strict_replay/summary/eadro_strict_replay_summary.json)
 - [GDN-official strict summary](E:/code/paper/code/TSFM_Anomaly_Detection/results/baselines/gdn_official_eadro_strict_s42_logs_e1/summary.json)
+- [External score ensemble strict summary](E:/code/paper/code/TSFM_Anomaly_Detection/results/baselines/eadro_strict_score_ensemble/xgb_mltraces_svm64_rank_step001_summary.json)
+- [External score ensemble replay summary](E:/code/paper/code/TSFM_Anomaly_Detection/results/baselines/eadro_strict_score_ensemble/xgb_mltraces_svm64_rank_step001_replay_summary.json)
+- [Service-aware MoE prior0.6 w/o logs summary](E:/code/paper/code/TSFM_Anomaly_Detection/results/experiments/eadro_sn/moe_stage2/service_aware_eadro_sn_s42_warmv6_topk2_lr3e4_blr0p1_prior0p6_wo_logs/service_aware_moe_eadro_seed42_bs4_ga1_topk2_prior_cyclic_0p6_wo_logs_anomaly_label_summary.json)
+- [Service-aware MoE prior0.6 w/o logs replay summary](E:/code/paper/code/TSFM_Anomaly_Detection/results/experiments/eadro_sn/realtime_moe/service_aware_eadro_sn_s42_warmv6_topk2_lr3e4_blr0p1_prior0p6_wo_logs_test_20260425_133459_summary.json)
+- [RBF-SVM ensemble strict summary](E:/code/paper/code/TSFM_Anomaly_Detection/results/baselines/svm_ensemble64_eadro_strict_s42_all_c10/summary.json)
 - [GDN-style strict summary](E:/code/paper/code/TSFM_Anomaly_Detection/results/baselines/gdn_eadro_strict_s42_logs_w10_e3_minmax/summary.json)
 - [TraceAnomaly strict summary](E:/code/paper/code/TSFM_Anomaly_Detection/results/baselines/traceanomaly_eadro_strict_s42/summary.json)
 - [TranAD strict summary](E:/code/paper/code/TSFM_Anomaly_Detection/results/baselines/tranad_eadro_strict_s42_logs/summary.json)

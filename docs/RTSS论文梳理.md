@@ -330,6 +330,9 @@ L_total = L_MSTGAD + lambda_pred * L_pred + lambda_bal * L_bal
 | `Anomaly Transformer` | MSDS | `F1=0.6250, P=0.4545, R=1.0000` | 已复现，但准确率明显弱于你们 |
 | `TranAD` stress replay | MSDS | 不同 interval 下都 `miss@100ms=0.0%`, `p99≈23.79~24.83ms` | 很强的轻量级 RTSS baseline |
 | `Anomaly Transformer` replay | MSDS | `miss@100ms=0.0%`, `p99=27.64ms`, `max=28.76ms` | 很快，但离线检测效果弱 |
+| `Service-aware MoE (prior=0.6, w/o logs)` | Eadro-SN strict | `F1=0.9327`, `miss@100ms=0.0%`, response `p99=69.80ms` | 当前在 Eadro 上最强 realtime-stable F1 版本，说明主架构可以在 deadline 内超过外部 slow ensemble |
+| `XGBoost + RBF-SVM score ensemble` | Eadro-SN strict | `F1=0.9075`, `miss@100ms=96.0%`, processing `p99=154.65ms`, response `p99=2242.23ms` | 新补的外部高精度 / 慢 baseline；离线强于 full-modality MoE，但弱于 F1 冲高版，且无法满足实时 deadline |
+| `RBF-SVM ensemble` | Eadro-SN strict | `F1=0.8589`, `miss@100ms=100.0%`, processing `p99=147.65ms`, response `p99=1167.25ms` | score ensemble 的 slow component；单独也明显强于 `GDN-official` |
 | `Service-aware MoE` | MSDS / RE2-TT | 多 seed `0% miss`，同时保持不错 F1 | 复杂模型也能稳定实时运行 |
 
 ## 6. 消融实验
