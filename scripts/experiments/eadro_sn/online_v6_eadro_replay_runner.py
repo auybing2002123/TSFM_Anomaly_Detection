@@ -52,6 +52,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=100)
     parser.add_argument("--warmup-samples", type=int, default=3)
     parser.add_argument("--threshold", type=float, default=None, help="Override window anomaly threshold")
+    parser.add_argument(
+        "--window-score-method",
+        choices=["max", "top2_mean", "top3_mean", "max_times_top2_mean"],
+        default="max",
+        help="Window-level score computed from service anomaly probabilities",
+    )
     parser.add_argument("--interval-ms", type=float, default=100.0)
     parser.add_argument("--deadline-ms", type=float, default=100.0)
     parser.add_argument("--pace", action="store_true")
@@ -162,7 +168,26 @@ def extract_true_abnormal_services(batch: SampleBatch, service_names: list[str])
     ]
 
 
-def summarize_prediction(cls_probs: torch.Tensor, service_names: list[str], threshold: float, top_k: int = 3) -> Dict[str, Any]:
+def compute_window_score(anomaly_scores: np.ndarray, method: str) -> float:
+    sorted_scores = np.sort(anomaly_scores)
+    if method == "max":
+        return float(sorted_scores[-1])
+    if method == "top2_mean":
+        return float(sorted_scores[-2:].mean())
+    if method == "top3_mean":
+        return float(sorted_scores[-3:].mean())
+    if method == "max_times_top2_mean":
+        return float(sorted_scores[-1] * sorted_scores[-2:].mean())
+    raise ValueError(f"Unsupported window score method: {method}")
+
+
+def summarize_prediction(
+    cls_probs: torch.Tensor,
+    service_names: list[str],
+    threshold: float,
+    top_k: int = 3,
+    window_score_method: str = "max",
+) -> Dict[str, Any]:
     anomaly_scores = cls_probs[0, :, 1].numpy()
     sorted_indices = np.argsort(anomaly_scores)[::-1]
 
@@ -185,6 +210,7 @@ def summarize_prediction(cls_probs: torch.Tensor, service_names: list[str], thre
     root_service = top_services[0]["service"] if top_services else None
     root_idx = top_services[0]["idx"] if top_services else None
     root_score = top_services[0]["score"] if top_services else 0.0
+    window_score = compute_window_score(anomaly_scores, window_score_method)
 
     return {
         "top_services": top_services,
@@ -193,7 +219,9 @@ def summarize_prediction(cls_probs: torch.Tensor, service_names: list[str], thre
         "root_cause_idx": root_idx,
         "root_cause_score": root_score,
         "num_predicted_anomalies": len(predicted_anomalies),
-        "window_anomaly_prediction": bool(root_score >= threshold),
+        "window_score": window_score,
+        "window_score_method": window_score_method,
+        "window_anomaly_prediction": bool(window_score >= threshold),
     }
 
 
@@ -203,6 +231,7 @@ def timed_eadro_window_inference(
     sample_idx: int,
     threshold: float,
     preloaded_batch: Optional[SampleBatch] = None,
+    window_score_method: str = "max",
 ) -> Dict[str, Any]:
     sync_device(bundle.device)
     t0 = time.perf_counter()
@@ -228,7 +257,13 @@ def timed_eadro_window_inference(
     sync_device(bundle.device)
     t4 = time.perf_counter()
 
-    prediction = summarize_prediction(cls_probs, bundle.service_names, threshold, top_k=3)
+    prediction = summarize_prediction(
+        cls_probs,
+        bundle.service_names,
+        threshold,
+        top_k=3,
+        window_score_method=window_score_method,
+    )
     true_root_services = extract_true_root_services(batch_cpu, bundle.service_names)
     true_abnormal_services = extract_true_abnormal_services(batch_cpu, bundle.service_names)
     sync_device(bundle.device)
@@ -257,6 +292,7 @@ def warmup_runtime(
     start_index: int,
     threshold: float,
     prefetched_batches: Optional[Mapping[int, SampleBatch]] = None,
+    window_score_method: str = "max",
 ) -> None:
     warmup_count = max(0, min(warmup_samples, len(bundle.dataset) - start_index))
     for offset in range(warmup_count):
@@ -267,6 +303,7 @@ def warmup_runtime(
             sample_idx=sample_idx,
             threshold=threshold,
             preloaded_batch=None if prefetched_batches is None else prefetched_batches.get(sample_idx),
+            window_score_method=window_score_method,
         )
 
 
@@ -335,6 +372,7 @@ def print_step(record: Mapping[str, Any]) -> None:
         f"pred={int(record['window_anomaly_prediction'])} "
         f"root={root} "
         f"score={record['root_cause_score']:.4f} "
+        f"win={record.get('window_score', record['root_cause_score']):.4f} "
         f"proc={record['processing_ms']:.2f}ms "
         f"resp={record['response_time_ms']:.2f}ms "
         f"deadline={state}"
@@ -462,6 +500,7 @@ def main() -> int:
     print(f"Checkpoint   : {bundle.checkpoint_path}")
     print(f"Device       : {bundle.device}")
     print(f"Threshold    : {threshold:.4f} ({threshold_source})")
+    print(f"Window Score : {args.window_score_method}")
     print(
         f"Interval     : {interval_ms:.2f} ms, Deadline: {deadline_ms:.2f} ms, "
         f"Pace={args.pace}, Prefetch={args.prefetch}, PinMemory={args.pin_memory}"
@@ -488,6 +527,7 @@ def main() -> int:
         start_index=args.start_index,
         threshold=threshold,
         prefetched_batches=prefetched_batches,
+        window_score_method=args.window_score_method,
     )
 
     if bundle.device.type == "cuda":
@@ -511,6 +551,7 @@ def main() -> int:
             sample_idx=sample_idx,
             threshold=threshold,
             preloaded_batch=None if prefetched_batches is None else prefetched_batches.get(sample_idx),
+            window_score_method=args.window_score_method,
         )
         finish_time = time.perf_counter()
         response_time_ms = (finish_time - scheduled_release) * 1000.0
@@ -597,6 +638,7 @@ def main() -> int:
         "replay_detection_target": "window_anomaly",
         "replay_detection_threshold": threshold,
         "replay_detection_threshold_source": threshold_source,
+        "replay_window_score_method": args.window_score_method,
         "replay_detection_metrics": replay_detection_metrics,
         "replay_positive_rate": float(np.mean(replay_labels)) if replay_labels else 0.0,
         "offline_reference_metrics": offline_reference,

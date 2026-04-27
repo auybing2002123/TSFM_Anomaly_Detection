@@ -65,6 +65,48 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=100)
     parser.add_argument("--warmup-samples", type=int, default=3)
     parser.add_argument("--threshold", type=float, default=None, help="Override window anomaly threshold")
+    parser.add_argument(
+        "--window-score-method",
+        choices=["max", "top2_mean", "top3_mean", "max_times_top2_mean"],
+        default="max",
+        help="Window-level score computed from service anomaly probabilities",
+    )
+    parser.add_argument(
+        "--temporal-postprocess",
+        choices=[
+            "none",
+            "hold",
+            "confirm",
+            "confirm_or_high",
+            "confirm_or_high_maxlen",
+            "confirm_or_high_guarded_top3",
+            "hysteresis",
+        ],
+        default="none",
+        help="Causal temporal postprocess applied to window predictions after score thresholding",
+    )
+    parser.add_argument("--temporal-window", type=int, default=2)
+    parser.add_argument("--temporal-require", type=int, default=2)
+    parser.add_argument("--temporal-hold", type=int, default=0)
+    parser.add_argument("--temporal-max-active", type=int, default=0)
+    parser.add_argument(
+        "--temporal-low-threshold",
+        type=float,
+        default=None,
+        help="Low threshold for hysteresis; defaults to replay threshold when omitted",
+    )
+    parser.add_argument(
+        "--temporal-high-threshold",
+        type=float,
+        default=None,
+        help="Immediate trigger threshold for confirm_or_high; defaults to replay threshold when omitted",
+    )
+    parser.add_argument(
+        "--temporal-guard-top3-threshold",
+        type=float,
+        default=None,
+        help="For confirm_or_high_guarded_top3, require this third-service score for isolated high triggers.",
+    )
     parser.add_argument("--interval-ms", type=float, default=100.0)
     parser.add_argument("--deadline-ms", type=float, default=100.0)
     parser.add_argument("--pace", action="store_true")
@@ -135,6 +177,120 @@ def load_runtime_bundle_service_aware_eadro(
     return bundle, ckpt_args
 
 
+def replay_case_id(source_id: str) -> str:
+    return str(source_id).rsplit("_w", 1)[0]
+
+
+def apply_temporal_postprocess(
+    record: Dict[str, Any],
+    state: Dict[str, Any],
+    args: argparse.Namespace,
+    threshold: float,
+) -> None:
+    method = args.temporal_postprocess
+    raw_prediction = bool(record["window_anomaly_prediction"])
+    record["raw_window_anomaly_prediction"] = raw_prediction
+    record["temporal_postprocess"] = method
+    record["temporal_postprocess_ms"] = 0.0
+    if method == "none":
+        return
+
+    t0 = time.perf_counter()
+    current_case = replay_case_id(record["source_id"])
+    if state.get("case_id") != current_case:
+        state.clear()
+        state.update(
+            {
+                "case_id": current_case,
+                "history": [],
+                "hold_remaining": 0,
+                "active_count": 0,
+                "case_pos": 0,
+                "hysteresis_active": False,
+                "hysteresis_below_count": 0,
+            }
+        )
+
+    if method == "hold":
+        if raw_prediction:
+            prediction = True
+            state["hold_remaining"] = max(0, int(args.temporal_hold))
+        elif state["hold_remaining"] > 0:
+            prediction = True
+            state["hold_remaining"] -= 1
+        else:
+            prediction = False
+    elif method == "confirm":
+        history = state["history"]
+        history.append(int(raw_prediction))
+        window = max(1, int(args.temporal_window))
+        if len(history) > window:
+            del history[:-window]
+        prediction = sum(history) >= max(1, int(args.temporal_require))
+    elif method in {"confirm_or_high", "confirm_or_high_maxlen"}:
+        history = state["history"]
+        history.append(int(raw_prediction))
+        window = max(1, int(args.temporal_window))
+        if len(history) > window:
+            del history[:-window]
+        high_threshold = threshold if args.temporal_high_threshold is None else float(args.temporal_high_threshold)
+        prediction = float(record["window_score"]) >= high_threshold or sum(history) >= max(1, int(args.temporal_require))
+        if method == "confirm_or_high_maxlen":
+            if prediction:
+                state["active_count"] = int(state.get("active_count", 0)) + 1
+                max_active = max(0, int(args.temporal_max_active))
+                if max_active > 0 and state["active_count"] > max_active:
+                    prediction = False
+            elif float(record["window_score"]) < threshold:
+                state["active_count"] = 0
+    elif method == "confirm_or_high_guarded_top3":
+        history = state["history"]
+        prev_hits = sum(history)
+        history.append(int(raw_prediction))
+        window = max(1, int(args.temporal_window))
+        if len(history) > window:
+            del history[:-window]
+        high_threshold = threshold if args.temporal_high_threshold is None else float(args.temporal_high_threshold)
+        high = float(record["window_score"]) >= high_threshold
+        if high and prev_hits == 0 and int(state.get("case_pos", 0)) > 0:
+            guard_threshold = threshold if args.temporal_guard_top3_threshold is None else float(
+                args.temporal_guard_top3_threshold
+            )
+            top_services = record.get("top_services", [])
+            top3_score = float(top_services[2]["score"]) if len(top_services) >= 3 else 0.0
+            high = top3_score >= guard_threshold
+        prediction = high or sum(history) >= max(1, int(args.temporal_require))
+        if prediction:
+            state["active_count"] = int(state.get("active_count", 0)) + 1
+            max_active = max(0, int(args.temporal_max_active))
+            if max_active > 0 and state["active_count"] > max_active:
+                prediction = False
+        elif float(record["window_score"]) < threshold:
+            state["active_count"] = 0
+    elif method == "hysteresis":
+        score = float(record["window_score"])
+        low_threshold = threshold if args.temporal_low_threshold is None else float(args.temporal_low_threshold)
+        if not state["hysteresis_active"]:
+            state["hysteresis_active"] = score >= threshold
+            state["hysteresis_below_count"] = 0
+        elif score >= low_threshold:
+            state["hysteresis_below_count"] = 0
+        else:
+            state["hysteresis_below_count"] += 1
+            if state["hysteresis_below_count"] > max(0, int(args.temporal_hold)):
+                state["hysteresis_active"] = False
+                state["hysteresis_below_count"] = 0
+        prediction = bool(state["hysteresis_active"])
+    else:
+        raise ValueError(f"Unsupported temporal postprocess: {method}")
+
+    record["window_anomaly_prediction"] = bool(prediction)
+    state["case_pos"] = int(state.get("case_pos", 0)) + 1
+    record["temporal_postprocess_ms"] = (time.perf_counter() - t0) * 1000.0
+    record["postprocess_ms"] = float(record["postprocess_ms"]) + record["temporal_postprocess_ms"]
+    record["total_ms"] = float(record["total_ms"]) + record["temporal_postprocess_ms"]
+
+
 def main() -> int:
     args = parse_args()
     device = resolve_device(args.device)
@@ -176,6 +332,8 @@ def main() -> int:
     print(f"Checkpoint   : {bundle.checkpoint_path}")
     print(f"Device       : {bundle.device}")
     print(f"Threshold    : {threshold:.4f} ({threshold_source})")
+    print(f"Window Score : {args.window_score_method}")
+    print(f"Temporal     : {args.temporal_postprocess}")
     print(
         f"Interval     : {interval_ms:.2f} ms, Deadline: {deadline_ms:.2f} ms, "
         f"Pace={args.pace}, Prefetch={args.prefetch}, PinMemory={args.pin_memory}"
@@ -202,12 +360,14 @@ def main() -> int:
         start_index=args.start_index,
         threshold=threshold,
         prefetched_batches=prefetched_batches,
+        window_score_method=args.window_score_method,
     )
 
     if bundle.device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(bundle.device)
 
     events = []
+    temporal_state: Dict[str, Any] = {}
     interval_s = interval_ms / 1000.0
     base_release = time.perf_counter()
     for step in range(max_steps):
@@ -225,7 +385,9 @@ def main() -> int:
             sample_idx=sample_idx,
             threshold=threshold,
             preloaded_batch=None if prefetched_batches is None else prefetched_batches.get(sample_idx),
+            window_score_method=args.window_score_method,
         )
+        apply_temporal_postprocess(record, temporal_state, args, threshold)
         finish_time = time.perf_counter()
         response_time_ms = (finish_time - scheduled_release) * 1000.0
         processing_ms = (finish_time - actual_start) * 1000.0
@@ -316,6 +478,15 @@ def main() -> int:
         "replay_detection_target": "window_anomaly",
         "replay_detection_threshold": threshold,
         "replay_detection_threshold_source": threshold_source,
+        "replay_window_score_method": args.window_score_method,
+        "replay_temporal_postprocess": args.temporal_postprocess,
+        "replay_temporal_window": args.temporal_window,
+        "replay_temporal_require": args.temporal_require,
+        "replay_temporal_hold": args.temporal_hold,
+        "replay_temporal_max_active": args.temporal_max_active,
+        "replay_temporal_low_threshold": args.temporal_low_threshold,
+        "replay_temporal_high_threshold": args.temporal_high_threshold,
+        "replay_temporal_guard_top3_threshold": args.temporal_guard_top3_threshold,
         "replay_detection_metrics": replay_detection_metrics,
         "replay_positive_rate": float(np.mean(replay_labels)) if replay_labels else 0.0,
         "offline_reference_metrics": offline_reference,

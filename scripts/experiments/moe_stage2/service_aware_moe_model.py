@@ -262,6 +262,9 @@ class MultiModalServiceAwareMoE_MSDS(nn.Module):
         )
 
         self.latest_moe_balance_loss = torch.tensor(0.0)
+        self.expose_training_outputs = False
+        self.latest_cls_logits = None
+        self.latest_cls_probs = None
         self._print_info()
 
     def _print_info(self) -> None:
@@ -345,6 +348,12 @@ class MultiModalServiceAwareMoE_MSDS(nn.Module):
         deviation = deviation.reshape(batch_size, num_hosts, self.config.gpt2_dim)
         anomaly_feat = self.deviation_encoder(deviation)
         cls_result = self.classifier(anomaly_feat)
+        if self.expose_training_outputs:
+            self.latest_cls_logits = cls_result
+            self.latest_cls_probs = torch.softmax(cls_result, dim=-1)
+        else:
+            self.latest_cls_logits = None
+            self.latest_cls_probs = None
 
         recon_input = gpt_output[:, -1, :]
         recon = self.recon_head(recon_input).reshape(batch_size, num_hosts, -1)

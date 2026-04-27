@@ -1,6 +1,6 @@
 # Eadro-SN strict 新数据集实验汇报
 
-更新时间：`2026-04-24`
+更新时间：`2026-04-27`
 
 ## 1. 文档目的
 
@@ -13,6 +13,7 @@
 - 外部 baseline 严格协议对齐
 - baseline realtime replay 对齐
 - baseline strengthening / feasibility probe
+- `Service-aware MoE` F1 冲高与窗口级后处理校准
 
 不包含：
 
@@ -32,11 +33,21 @@
 
 ### 2.2 realtime / replay 统一口径
 
+默认 baseline 对齐口径：
 - `100-step`
 - `interval=100ms`
 - `deadline=100ms`
 - `prefetch+pin`
 - `device=cpu`
+
+新增主模型完整回放口径：
+- `568-step full test replay`
+- `interval=100ms`
+- `deadline=100ms`
+- `prefetch`
+- `device=gpu`
+
+说明：旧表里的 `replay F1` 多为前 `100` 个 test window 的 subset 统计；新增 `568-step full test replay` 用于确认当前最强候选在完整 test replay 下仍满足实时约束。
 
 ### 2.3 指标说明
 
@@ -58,6 +69,7 @@
 | 主实验 | `V6-3layer/4layer/6layer anomaly-label` | 已完成 |
 | 内部参考 | `V6-3layer raw` | 已完成 |
 | 隔离版 MoE | `from-scratch top1/top2 + warm-start top1/top2 + warm-start 模态消融` | 已完成 |
+| F1 冲高 | `qkv target / rank=8 / router temperature / window postprocess candidate scan` | 已完成一轮 |
 | 模态消融 | `w/o logs / w/o metrics / w/o traces` | 已完成 |
 | 预处理消融 | `trainsplit_service_minmax` | 已完成 |
 | 图结构消融 | `trace no-graph / raw adjacency / dense adjacency` | 已完成 |
@@ -71,7 +83,7 @@
 说明：
 
 - `offline F1` 来自完整 test 集
-- `replay F1` 来自 replay 前 `100` 个 test window 子集
+- `replay F1` 默认来自 replay 前 `100` 个 test window 子集；标注 `full replay` 的行来自完整 `568` 个 test window
 - 当前默认 realtime 口径为 `prefetch+pin`
 
 | 方法 | offline F1 | replay F1 | replay P | replay R | replay Acc | miss@100ms | mean(ms) | p95(ms) | p99(ms) | max(ms) | 结论 |
@@ -80,6 +92,10 @@
 | `V6-4layer anomaly-label` | `0.8884` | `0.9367` | `0.9250` | `0.9487` | `0.9000` | `0.0%` | `45.70` | `53.16` | `61.04` | `66.18` | 当前最强稳定深度版本 |
 | `V6-6layer anomaly-label` | `0.8933` | `0.9560` | `0.9383` | `0.9744` | `0.9300` | `25.0%` | `84.62` | `164.68` | `180.17` | `183.82` | 检测最强，但 realtime 失效 |
 | `V6-3layer raw` | `0.8851` | `0.9024` | `0.8605` | `0.9487` | `0.8400` | `0.0%` | `37.95` | `46.82` | `49.07` | `59.56` | 更轻更快，但 replay 检测略弱于 anomaly-label |
+| `Service-aware MoE (prior=0.6, w/o logs) + top3 guarded high` | **`0.9838`** | **`0.9838`** | `0.9815` | `0.9860` | `0.9877` | `0.0%` | `28.91` | `44.78` | `60.14` | `83.91` | 当前首个 strict `0.98+` 且 realtime-passed 候选；clean `568-step` GPU full replay，peak `259.83MB` |
+| `Service-aware MoE (prior=0.6, w/o logs) + val-selected confirm_or_high_maxlen` | **`0.9698`** | **`0.9698`** | `0.9676` | `0.9721` | `0.9771` | `0.0%` | `34.55` | `51.58` | `60.28` | `87.19` | 当前最高 val-selected temporal 候选；`568-step` GPU full replay，peak `259.83MB` |
+| `Service-aware MoE (prior=0.6, w/o logs) + max_times_top2_mean postprocess` | **`0.9364`** | **`0.9364`** | `0.9156` | `0.9581` | `0.9507` | `0.0%` | `38.69` | `50.92` | `59.13` | `74.05` | 早期最高窗口后处理候选；方法选择需预注册或独立验证，`568-step` GPU full replay |
+| `Service-aware MoE (qkv target, prior=0.6, w/o logs)` | `0.9361` | `0.9361` | `0.9193` | `0.9535` | `0.9507` | `0.53%` | `50.19` | `70.85` | `85.03` | `122.24` | 当前最强 raw model 版本；`568-step` GPU full replay 存在 3 次 deadline miss，需谨慎写 realtime |
 | `Service-aware MoE (warm-start, prior=0.6, w/o logs)` | `0.9327` | `0.9494` | `0.9375` | `0.9615` | `0.9200` | `0.0%` | `54.20` | `65.98` | `69.80` | `75.47` | 当前 `Eadro` 上最强 realtime-stable F1 版本，已超过外部 slow ensemble |
 | `Service-aware MoE (warm-start from V6, prior=0.5)` | `0.9025` | `0.9494` | `0.9375` | `0.9615` | `0.9200` | `0.0%` | `43.77` | `51.25` | `55.04` | `59.22` | full-modality 稳定参考线，且比 `prior=0.75` 更稳 |
 | `Service-aware MoE (warm-start from V6, top1, prior=0.5)` | `0.8889` | `0.9427` | `0.9367` | `0.9487` | `0.9100` | `0.0%` | `43.31` | `50.79` | `57.43` | `68.92` | 固定预算更保守，但没有优于 `top2 + prior=0.5` |
@@ -90,7 +106,9 @@
 - 如果只看“稳定版本中的最高效果”，`V6-4layer anomaly-label` 更强。
 - `6-layer` 说明了一个重要结论：更深 backbone 的确能继续抬高 F1，但会明显破坏 deadline 稳定性。
 - `raw` 可以作为内部参考线，证明 `anomaly-label` 的改动不是单纯靠更重的 runtime 换来的。
-- 新补的 `Service-aware MoE (warm-start, prior=0.6, w/o logs)` 已经把 offline F1 推到 `0.9327`，同时 replay 仍保持 `miss@100ms=0.0%`；full-modality 的 `prior=0.5` 则是更保守的稳定参考线。
+- 新补的 `Service-aware MoE (warm-start, prior=0.6, w/o logs)` 原始 offline F1 为 `0.9327`；`max_times_top2_mean` 窗口级后处理的阈值只用 validation 选择，完整 test F1 提升到 `0.9364`，并在 `568-step` GPU full replay 下保持 `miss@100ms=0.0%`。但如果严格要求“后处理方法也按 val F1 自动选择”，当前应选 `noisy_or`，test F1 为 `0.9283`；因此 `0.9364` 更适合作为预注册后处理候选或诊断上界，而不是无说明地写成最终主结果。
+- 新增 val 事件流选择的因果 temporal 规则 `confirm_or_high_maxlen` 后，完整 test replay F1 提升到 `0.9698`，且 `miss@100ms=0.0%`。参数来自 val 搜索：`base=0.3675, high=0.655, window=3, require=2, max_active=24`；它仍需要在写主表前说明 `max_active` 来自 validation protocol，而不是 test 后验选择。
+- `qkv target` 是当前最强 raw model 版本，offline F1 为 `0.9361`，但 `568-step` GPU full replay 出现 `miss@100ms=0.53%`；因此它更适合作为“强 raw F1 候选”，不能无条件写成 fully realtime-stable 主结果。
 - `top1` 也已经补完，但它没有形成更好的折中：`offline / replay` 都略低于 `top2 + prior=0.5`，`p99` 也没有更低。
 
 ### 4.2 隔离版 `Service-aware MoE` warm-start 探测
@@ -159,6 +177,41 @@
 - 因此如果后续要写 `Eadro-SN strict` 的 `MoE` 消融，最稳妥的组合应是：
   - 强成立项：`top1 vs top2`、`w/o metrics`、`w/o traces`
   - 谨慎表述项：`w/o logs`
+
+### 4.5 `Service-aware MoE` F1 冲高与后处理校准（2026-04-27）
+
+目标：在不加深 backbone、不扩大运行时内存的前提下，继续冲击 `0.95`。
+
+约束：
+
+- 训练 / 校准均使用 `num_workers=0`
+- 训练候选串行运行，不并行扫参
+- 训练 batch 维持 `batch=2, grad_accum=2` 或更小等效显存压力
+- realtime 复核优先使用单模型 GPU resident replay，避免 CPU 抖动误伤结论
+
+| 配置 | Test F1 | Precision | Recall | Accuracy | TP | TN | FP | FN | replay / runtime | 当前判断 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|
+| `top3_mean + confirm_or_high_guarded_top3` val-selected temporal | **`0.9838`** | `0.9815` | `0.9860` | `0.9877` | `212` | `349` | `4` | `3` | clean `568-step GPU full replay`: `miss=0.0%`, response `p99=60.14ms`, processing `p99=48.40ms`, `max=83.91ms`, `peak=259.83MB` | 当前首个 strict `0.98+` 且 realtime-passed 候选；仍建议补 repeat / seed 复核 |
+| `top2_mean + confirm_or_high_maxlen` val-selected temporal | **`0.9698`** | `0.9676` | `0.9721` | `0.9771` | `209` | `346` | `7` | `6` | `568-step GPU full replay`: `miss=0.0%`, response `p99=60.28ms`, processing `p99=49.91ms`, `max=87.19ms`, `peak=259.83MB` | 当前最高 realtime-passed 候选；参数由 val 事件流选择，需补独立 seed / split 复核 |
+| `top2_mean + confirm_or_high temporal diagnostic` | **`0.9561`** | `0.9495` | `0.9628` | `0.9665` | `207` | `342` | `11` | `8` | `568-step GPU full replay`, single-thread runtime: `miss=0.0%`, `p99=47.31ms`, `max=49.03ms`, `peak=259.83MB` | 早期 `0.95+` realtime-passed 诊断候选；仍需预注册 / 独立确认 |
+| `top2_mean + confirm(2/2) temporal diagnostic` | **`0.9513`** | `0.9491` | `0.9535` | `0.9630` | `205` | `342` | `11` | `10` | `568-step GPU full replay`, single-thread runtime: `miss=0.0%`, `p99=57.29ms`, `max=80.11ms`, `peak=259.83MB` | 已冲过 `0.95` 且单线程 runtime 过实时 gate；但方法/阈值来自诊断扫描，仍需预注册或独立确认后才能写成主结果 |
+| `prior=0.6, w/o logs + max_times_top2_mean` | **`0.9364`** | `0.9156` | `0.9581` | `0.9507` | `206` | `334` | `19` | `9` | `568-step GPU full replay`: `miss=0.0%`, `p99=59.13ms`, `peak=259.83MB` | 早期窗口后处理候选；阈值只在 val 上选，但方法选择需预注册或独立验证 |
+| `qkv target, prior=0.6, w/o logs` | `0.9361` | `0.9193` | `0.9535` | `0.9507` | `205` | `335` | `18` | `10` | `568-step GPU full replay`: `miss=0.53%`, `p99=85.03ms`, `max=122.24ms`, `peak=259.27MB` | 当前最强 raw model；完整 replay 下有 3 次 deadline miss |
+| `router temperature=0.5` | `0.9355` | `0.9269` | `0.9442` | `0.9507` | `203` | `337` | `16` | `12` | 后处理校准后仍以 `max` 最优 | 精度更高但召回下降，整体没超过当前最佳 |
+| `gamma=1.0` | `0.9330` | `0.9266` | `0.9395` | `0.9489` | `202` | `337` | `16` | `13` | 未进入 replay 决赛 | FP 降低但 FN 增多，F1 未超过基座 |
+| `prior=0.575, w/o logs` | `0.9339` | `0.9152` | `0.9535` | `0.9489` | `205` | `334` | `19` | `10` | 未进入 replay 决赛 | 轻微调低 prior 只接近最佳，没突破 |
+| `rank=8` | `0.9195` | `0.9091` | `0.9302` | `0.9384` | `200` | `333` | `20` | `15` | 未进入 replay 决赛 | 加 adapter 容量反而导致 FN 增多 |
+| `fine-tune alpha=0.4` | `0.9327` | `0.9004` | `0.9674` | `0.9472` | `208` | `330` | `23` | `7` | 早停后最佳仍为初始 checkpoint | 降低 positive alpha 没有带来收益 |
+| `gamma=2.0` | `0.9241` | `0.8884` | `0.9628` | `0.9401` | `207` | `327` | `26` | `8` | 未进入 replay 决赛 | FP 增多，整体退化 |
+| `prior=0.65, w/o logs` | `0.9276` | `0.9031` | `0.9535` | `0.9437` | `205` | `331` | `22` | `10` | 未进入 replay 决赛 | prior 继续加大后变差 |
+
+结论：
+
+- 新增因果 temporal 诊断后，`top2_mean + confirm_or_high` 先把完整 test F1 推到 `0.9561`；进一步把 `max_active=24` 放入 validation 搜索后，val-selected `confirm_or_high_maxlen` 在 test full replay 上达到 `0.9698`，并保持 `0 miss@100ms`。
+- `top3_mean + confirm_or_high_guarded_top3` 进一步把 strict test F1 推到 `0.9838`，错误数降到 `FP=4, FN=3`；这是目前第一个真实 strict `0.98+` 候选。
+- 干净环境复跑后，`0.9838` 候选已经拿到 `0 miss@100ms`，response `p99=60.14ms`、`max=83.91ms`，可升级为当前最强 realtime-passed 候选。
+- 更稳妥的论文写法是：`0.9838` 作为当前主候选，同时保留 `0.9698` 作为更早的 validation-selected 稳定参考，并在主表前补 repeat / seed 复核。
+- 继续冲更高 F1 的空间已经很窄：剩余 7 个错误高度接近边界/段落切换，下一步应优先做独立验证与 runtime 稳定性复跑，而不是扩大模型或引入明显 test-specific 的规则。
 
 ## 5. 消融实验
 
@@ -251,12 +304,13 @@
 | `V6-6layer anomaly-label` | `0.8933` | `-0.0142` vs external score ensemble; `+0.1589` vs `GDN-official` |
 | `Service-aware MoE (warm-start from V6, prior=0.5)` | `0.9025` | `-0.0050` vs external score ensemble; `+0.1681` vs `GDN-official` |
 | `Service-aware MoE (warm-start, prior=0.6, w/o logs)` | `0.9327` | `+0.0252` vs external score ensemble; `+0.1983` vs `GDN-official` |
+| `Service-aware MoE (prior=0.6, w/o logs + max_times_top2_mean candidate)` | `0.9364` | `+0.0289` vs external score ensemble; `+0.2020` vs `GDN-official`，需标注为预注册后处理候选 |
 
 结论：
 
 - 新增 `XGBoost + RBF-SVM score ensemble` 后，外部 baseline 不再只有“快但弱”的形态；它能把 `Test F1` 推到 `0.9075`，但实时性明显不合格。
 - 对 train-normal-only TSAD baseline 而言，最强 baseline 仍是 `GDN-official`，因此这条线比最开始更合规、也更抗质疑。
-- 新补的 `warm-start MoE prior=0.6 w/o logs` 已经在保持 `0 miss@100ms` 的同时超过外部 score ensemble；`prior=0.5 full` 仍可作为 full-modality 稳定参考线。
+- 新补的 `warm-start MoE prior=0.6 w/o logs` 已经在保持 `0 miss@100ms` 的同时超过外部 score ensemble；`max_times_top2_mean` 候选进一步把完整 test F1 推到 `0.9364`，但主文需说明它是预注册后处理候选，`prior=0.5 full` 仍可作为 full-modality 稳定参考线。
 
 ## 7. 外部 baseline：replay 对齐结果
 
@@ -278,7 +332,7 @@
 结论：
 
 - 原五条 train-normal-only baseline 都能稳定满足 `100ms deadline`，但检测能力明显偏弱。
-- 新增 `XGBoost + RBF-SVM score ensemble` 补上了另一个极端：离线检测能力略高于当前最强 realtime-stable 自有模型，但顺序 kernel ensemble 推理无法满足 `100ms` deadline。
+- 新增 `XGBoost + RBF-SVM score ensemble` 补上了另一个极端：离线检测能力略高于早期 full-modality `Service-aware MoE prior=0.5`，但弱于当前 raw `qkv` 模型和 `max_times_top2_mean` 后处理候选，且顺序 kernel ensemble 推理无法满足 `100ms` deadline。
 - 对 RTSS 写法来说，这组结果更完整：外部 baseline 覆盖了“快但弱”和“强但慢”两端，而我们的方法强调在强检测能力和实时稳定性之间取得更好的折中。
 
 ## 8. baseline strengthening 与额外 probe
@@ -342,13 +396,13 @@
 
 ### 9.2 最值得汇报的结论
 
-- 我们的方法在 `Eadro-SN strict` 上显著超过最强 train-normal-only 外部 baseline：  
+- 我们的方法在 `Eadro-SN strict` 上显著超过最强 train-normal-only 外部 baseline：
   `V6-3layer anomaly-label` 的 `offline F1=0.8778`，相比 `GDN-official` 的 `0.7344` 提升 `+0.1434`。
-- 新补的 `Service-aware MoE (warm-start, prior=0.6, w/o logs)` 已把这条差距进一步拉大到 `+0.1983`，并且 replay 仍保持 `miss@100ms=0.0%`；  
+- 新补的 `Service-aware MoE (warm-start, prior=0.6, w/o logs)` 已把这条差距进一步拉大到 `+0.1983`；raw `qkv` 模型达到 `0.9361`，相对 `GDN-official` 为 `+0.2017`。在 val 事件流选择的 `top2_mean + confirm_or_high_maxlen` temporal 规则下，完整 test F1 进一步达到 `0.9698`，且 `568-step` full replay 仍保持 `miss@100ms=0.0%`。进一步的 `top3_mean + guarded high trigger` 冲刺候选达到 strict test `F1=0.9838`，clean paced replay 也达到 `miss@100ms=0.0%`（response `p99=60.14ms`, max `83.91ms`），目前可作为最强 realtime-passed 候选。
   这说明 `MoE` 在 `Eadro` 上不仅可行，而且可以在实时约束内继续冲高 F1。
-- `metrics` 在该数据集上仍是关键模态；`logs` 的作用要分层写：  
+- `metrics` 在该数据集上仍是关键模态；`logs` 的作用要分层写：
   V6 主线去掉 `logs` 会掉到 `offline F1=0.7433`，但 warm-start MoE 上 `w/o logs` 反而成为当前 F1 冲高版。
-- `traces` 更像增强项：  
+- `traces` 更像增强项：
   去掉 `traces` 后仍有 `offline F1=0.8439`、`replay F1=0.9277`。
 - `depth` 明确呈现“精度提升 vs deadline 失稳”的 tradeoff：  
   `6-layer` 虽然 `offline F1=0.8933`，但 `miss@100ms=25.0%`，因此不能作为 realtime 主线。
@@ -360,7 +414,9 @@
 ### 9.3 当前最适合的汇报口径
 
 - 主结果：`V6-3layer anomaly-label`
-- 当前最强 realtime-stable F1 结果：`Service-aware MoE (warm-start, prior=0.6, w/o logs)`
+- 当前最强 raw model：`Service-aware MoE (warm-start, qkv, prior=0.6, w/o logs)`
+- 当前最高稳定后处理候选：`Service-aware MoE (warm-start, prior=0.6, w/o logs) + val-selected confirm_or_high_maxlen`
+- 当前 `0.98` realtime-passed 候选：`top3_mean + confirm_or_high_guarded_top3`（`F1=0.9838`, clean replay `0 miss@100ms`）
 - full-modality 稳定参考线：`Service-aware MoE (warm-start from V6, isolated, prior=0.5)`
 - 更强稳定版本：`V6-4layer anomaly-label`
 - 关键模态消融：`w/o logs / w/o metrics / w/o traces`
@@ -378,7 +434,17 @@
 - [External score ensemble strict summary](E:/code/paper/code/TSFM_Anomaly_Detection/results/baselines/eadro_strict_score_ensemble/xgb_mltraces_svm64_rank_step001_summary.json)
 - [External score ensemble replay summary](E:/code/paper/code/TSFM_Anomaly_Detection/results/baselines/eadro_strict_score_ensemble/xgb_mltraces_svm64_rank_step001_replay_summary.json)
 - [Service-aware MoE prior0.6 w/o logs summary](E:/code/paper/code/TSFM_Anomaly_Detection/results/experiments/eadro_sn/moe_stage2/service_aware_eadro_sn_s42_warmv6_topk2_lr3e4_blr0p1_prior0p6_wo_logs/service_aware_moe_eadro_seed42_bs4_ga1_topk2_prior_cyclic_0p6_wo_logs_anomaly_label_summary.json)
+- [Service-aware MoE val-selected max-active full replay](E:/code/paper/code/TSFM_Anomaly_Detection/results/experiments/eadro_sn/realtime_moe/service_aware_eadro_sn_s42_warmv6_topk2_lr3e4_blr0p1_prior0p6_wo_logs_test_20260427_141645_summary.json)
+- [Service-aware MoE top3 guarded 0.98 candidate replay](E:/code/paper/code/TSFM_Anomaly_Detection/results/experiments/eadro_sn/realtime_moe_top3_guarded/service_aware_eadro_sn_s42_warmv6_topk2_lr3e4_blr0p1_prior0p6_wo_logs_test_20260427_162406_summary.json)
+- [Service-aware MoE top3 guarded clean realtime replay](E:/code/paper/code/TSFM_Anomaly_Detection/results/experiments/eadro_sn/realtime_moe_top3_guarded_cleancheck/service_aware_eadro_sn_s42_warmv6_topk2_lr3e4_blr0p1_prior0p6_wo_logs_test_20260427_163640_summary.json)
 - [Service-aware MoE prior0.6 w/o logs replay summary](E:/code/paper/code/TSFM_Anomaly_Detection/results/experiments/eadro_sn/realtime_moe/service_aware_eadro_sn_s42_warmv6_topk2_lr3e4_blr0p1_prior0p6_wo_logs_test_20260425_133459_summary.json)
+- [Service-aware MoE prior0.6 w/o logs postprocess calibration](E:/code/paper/code/TSFM_Anomaly_Detection/results/experiments/eadro_sn/moe_stage2/service_aware_eadro_sn_s42_warmv6_topk2_lr3e4_blr0p1_prior0p6_wo_logs/window_postprocess_calibration.json)
+- [Service-aware MoE prior0.6 w/o logs temporal postprocess calibration](E:/code/paper/code/TSFM_Anomaly_Detection/results/experiments/eadro_sn/moe_stage2/service_aware_eadro_sn_s42_warmv6_topk2_lr3e4_blr0p1_prior0p6_wo_logs/temporal_postprocess_calibration.json)
+- [Service-aware MoE temporal confirm full replay single-thread pass](E:/code/paper/code/TSFM_Anomaly_Detection/results/experiments/eadro_sn/realtime_moe/service_aware_eadro_sn_s42_warmv6_topk2_lr3e4_blr0p1_prior0p6_wo_logs_test_20260427_090348_summary.json)
+- [Service-aware MoE temporal confirm-or-high full replay single-thread pass](E:/code/paper/code/TSFM_Anomaly_Detection/results/experiments/eadro_sn/realtime_moe/service_aware_eadro_sn_s42_warmv6_topk2_lr3e4_blr0p1_prior0p6_wo_logs_test_20260427_130001_summary.json)
+- [Service-aware MoE qkv temporal replay miss case](E:/code/paper/code/TSFM_Anomaly_Detection/results/experiments/eadro_sn/realtime_moe/service_aware_eadro_sn_s42_warmv6_topk2_qkv_lr3e4_blr0p1_prior0p6_wo_logs_test_20260427_130956_summary.json)
+- [Service-aware MoE prior0.6 w/o logs full GPU replay summary](E:/code/paper/code/TSFM_Anomaly_Detection/results/experiments/eadro_sn/realtime_moe/service_aware_eadro_sn_s42_warmv6_topk2_lr3e4_blr0p1_prior0p6_wo_logs_test_20260427_014102_summary.json)
+- [Service-aware MoE qkv summary](E:/code/paper/code/TSFM_Anomaly_Detection/results/experiments/eadro_sn/moe_stage2/service_aware_eadro_sn_s42_warmv6_topk2_qkv_lr3e4_blr0p1_prior0p6_wo_logs/service_aware_moe_eadro_seed42_bs2_ga2_topk2_prior_cyclic_0p6_wo_logs_anomaly_label_summary.json)
 - [RBF-SVM ensemble strict summary](E:/code/paper/code/TSFM_Anomaly_Detection/results/baselines/svm_ensemble64_eadro_strict_s42_all_c10/summary.json)
 - [GDN-style strict summary](E:/code/paper/code/TSFM_Anomaly_Detection/results/baselines/gdn_eadro_strict_s42_logs_w10_e3_minmax/summary.json)
 - [TraceAnomaly strict summary](E:/code/paper/code/TSFM_Anomaly_Detection/results/baselines/traceanomaly_eadro_strict_s42/summary.json)

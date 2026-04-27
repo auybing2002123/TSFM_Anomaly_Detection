@@ -6,7 +6,9 @@ import time
 from pathlib import Path
 import sys
 
+import numpy as np
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
 
@@ -111,6 +113,12 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Scale factor applied to non-MoE trainable parameters",
     )
+    parser.add_argument(
+        "--finetune-scope",
+        choices=["all", "head"],
+        default="all",
+        help="all: train existing trainable params; head: train deviation encoder and classifier only",
+    )
     parser.add_argument("--patience", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -121,6 +129,24 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional V6 checkpoint to warm-start shared weights before MoE finetuning",
     )
+    parser.add_argument(
+        "--init-from-moe-checkpoint",
+        type=str,
+        default="",
+        help="Optional service-aware MoE checkpoint for low-memory finetuning",
+    )
+
+    parser.add_argument("--window-loss-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--window-loss-score-method",
+        choices=["max", "top2_mean", "max_times_top2_mean"],
+        default="top2_mean",
+    )
+    parser.add_argument("--boundary-loss-weight", type=float, default=0.0)
+    parser.add_argument("--boundary-onset-window", type=int, default=0)
+    parser.add_argument("--boundary-onset-extra-weight", type=float, default=0.0)
+    parser.add_argument("--boundary-recovery-window", type=int, default=0)
+    parser.add_argument("--boundary-recovery-extra-weight", type=float, default=0.0)
 
     parser.add_argument("--disable-metrics", action="store_true")
     parser.add_argument("--disable-logs", action="store_true")
@@ -201,11 +227,176 @@ def load_v6_warm_start(
     }
 
 
+def load_moe_warm_start(
+    model: torch.nn.Module,
+    checkpoint_path: Path,
+) -> dict[str, object]:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    incompatible = model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    return {
+        "source_checkpoint": str(checkpoint_path),
+        "source_epoch": checkpoint.get("epoch"),
+        "source_f1": checkpoint.get("f1"),
+        "source_selection_target": checkpoint.get("selection_target"),
+        "missing_after_load": list(incompatible.missing_keys),
+        "unexpected_after_load": list(incompatible.unexpected_keys),
+        "source_args": checkpoint.get("args", {}),
+    }
+
+
+def parse_window_index(case_name: str) -> int:
+    try:
+        return int(case_name.rsplit("_w", 1)[1])
+    except (IndexError, ValueError):
+        return -1
+
+
+def case_id(case_name: str) -> str:
+    return case_name.rsplit("_w", 1)[0]
+
+
+def build_boundary_weight_map(
+    dataset,
+    args: argparse.Namespace,
+) -> tuple[dict[str, float], dict[str, int | float]]:
+    if args.boundary_loss_weight <= 0:
+        return {}, {"weighted_samples": 0}
+    if args.boundary_onset_extra_weight <= 0 and args.boundary_recovery_extra_weight <= 0:
+        return {}, {"weighted_samples": 0}
+
+    entries = getattr(dataset, "entries", [])
+    base_dir = getattr(dataset, "base_dir", None)
+    if not entries or base_dir is None:
+        return {}, {"weighted_samples": 0}
+
+    grouped: dict[str, list[dict]] = {}
+    for entry in entries:
+        grouped.setdefault(case_id(str(entry["case_name"])), []).append(entry)
+
+    weight_map: dict[str, float] = {}
+    onset_count = 0
+    recovery_count = 0
+    positive_windows = 0
+
+    for _, case_entries in grouped.items():
+        ordered = sorted(
+            case_entries,
+            key=lambda item: parse_window_index(str(item["case_name"])),
+        )
+        labels: list[int] = []
+        for entry in ordered:
+            with np.load(Path(base_dir) / entry["npz_path"]) as data:
+                gt_cls = data["groundtruth_cls"]
+                labels.append(int(((gt_cls[:, 1] + gt_cls[:, 2]) > 0).any()))
+        positive_windows += int(sum(labels))
+
+        idx = 0
+        while idx < len(labels):
+            if labels[idx] == 0:
+                idx += 1
+                continue
+
+            start = idx
+            while idx < len(labels) and labels[idx] == 1:
+                idx += 1
+            end = idx - 1
+
+            onset_end = min(end, start + max(args.boundary_onset_window, 0) - 1)
+            if args.boundary_onset_window > 0 and args.boundary_onset_extra_weight > 0:
+                for pos in range(start, onset_end + 1):
+                    name = str(ordered[pos]["case_name"])
+                    weight_map[name] = weight_map.get(name, 0.0) + args.boundary_onset_extra_weight
+                    onset_count += 1
+
+            recovery_end = min(len(labels) - 1, end + max(args.boundary_recovery_window, 0))
+            if args.boundary_recovery_window > 0 and args.boundary_recovery_extra_weight > 0:
+                for pos in range(end + 1, recovery_end + 1):
+                    if labels[pos] != 0:
+                        continue
+                    name = str(ordered[pos]["case_name"])
+                    weight_map[name] = weight_map.get(name, 0.0) + args.boundary_recovery_extra_weight
+                    recovery_count += 1
+
+    return weight_map, {
+        "weighted_samples": len(weight_map),
+        "onset_samples": onset_count,
+        "recovery_samples": recovery_count,
+        "positive_windows": positive_windows,
+        "boundary_loss_weight": args.boundary_loss_weight,
+        "boundary_onset_window": args.boundary_onset_window,
+        "boundary_recovery_window": args.boundary_recovery_window,
+    }
+
+
+def compute_window_scores(service_probs: torch.Tensor, method: str) -> torch.Tensor:
+    if method == "max":
+        return service_probs.max(dim=1).values
+    if method == "top2_mean":
+        k = min(2, service_probs.shape[1])
+        return torch.topk(service_probs, k=k, dim=1).values.mean(dim=1)
+    if method == "max_times_top2_mean":
+        k = min(2, service_probs.shape[1])
+        top2_mean = torch.topk(service_probs, k=k, dim=1).values.mean(dim=1)
+        return service_probs.max(dim=1).values * top2_mean
+    raise ValueError(f"Unsupported window score method: {method}")
+
+
+def compute_extra_window_losses(
+    model: torch.nn.Module,
+    gt_cls_raw: torch.Tensor,
+    case_names: list[str],
+    boundary_weights: dict[str, float],
+    args: argparse.Namespace,
+    device: torch.device,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    zero = gt_cls_raw.new_tensor(0.0)
+    parts = {"window_loss": 0.0, "boundary_loss": 0.0}
+    if args.window_loss_weight <= 0 and args.boundary_loss_weight <= 0:
+        return zero, parts
+
+    cls_probs = getattr(model, "latest_cls_probs", None)
+    if cls_probs is None:
+        return zero, parts
+
+    service_probs = cls_probs[..., 1]
+    window_scores = compute_window_scores(service_probs, args.window_loss_score_method).clamp(1e-6, 1 - 1e-6)
+    window_labels = ((gt_cls_raw[..., 1] + gt_cls_raw[..., 2]) > 0).any(dim=1).float()
+
+    extra_loss = zero
+    if args.window_loss_weight > 0:
+        window_loss = F.binary_cross_entropy(window_scores, window_labels)
+        extra_loss = extra_loss + args.window_loss_weight * window_loss
+        parts["window_loss"] = float(window_loss.detach().item())
+
+    if args.boundary_loss_weight > 0 and boundary_weights:
+        weights = torch.tensor(
+            [boundary_weights.get(str(name), 0.0) for name in case_names],
+            device=device,
+            dtype=window_scores.dtype,
+        )
+        weight_sum = weights.sum()
+        if float(weight_sum.detach().item()) > 0:
+            per_sample = F.binary_cross_entropy(window_scores, window_labels, reduction="none")
+            boundary_loss = (per_sample * weights).sum() / weight_sum
+            extra_loss = extra_loss + args.boundary_loss_weight * boundary_loss
+            parts["boundary_loss"] = float(boundary_loss.detach().item())
+
+    return extra_loss, parts
+
+
 def build_optimizer(
     model: torch.nn.Module,
     lr: float,
     base_lr_scale: float,
+    finetune_scope: str,
 ) -> tuple[torch.optim.Optimizer, dict[str, int | float]]:
+    if finetune_scope == "head":
+        train_prefixes = ("deviation_encoder.", "classifier.")
+        for name, param in model.named_parameters():
+            param.requires_grad = name.startswith(train_prefixes)
+    elif finetune_scope != "all":
+        raise ValueError(f"Unsupported finetune scope: {finetune_scope}")
+
     moe_params = []
     base_params = []
     moe_keywords = ("experts_A", "experts_B", ".router.")
@@ -236,6 +427,7 @@ def build_optimizer(
 
     optimizer = torch.optim.AdamW(param_groups, lr=lr, weight_decay=1e-4)
     stats = {
+        "finetune_scope": finetune_scope,
         "base_lr": lr * base_lr_scale,
         "moe_lr": lr,
         "base_param_tensors": len(base_params),
@@ -270,6 +462,25 @@ def summary_name(args: argparse.Namespace) -> str:
         parts.append(f"adj_{args.adjacency_mode}")
     if args.label_mode != "root":
         parts.append(f"{args.label_mode}_label")
+    if args.init_from_moe_checkpoint:
+        parts.append("moeinit")
+    if args.finetune_scope != "all":
+        parts.append(f"scope_{args.finetune_scope}")
+    if args.window_loss_weight > 0:
+        parts.append(
+            f"winloss{args.window_loss_weight:g}".replace(".", "p")
+            + f"_{args.window_loss_score_method}"
+        )
+    if args.boundary_loss_weight > 0:
+        parts.append(f"bdloss{args.boundary_loss_weight:g}".replace(".", "p"))
+        if args.boundary_onset_window > 0:
+            parts.append(
+                f"on{args.boundary_onset_window}x{args.boundary_onset_extra_weight:g}".replace(".", "p")
+            )
+        if args.boundary_recovery_window > 0:
+            parts.append(
+                f"rec{args.boundary_recovery_window}x{args.boundary_recovery_extra_weight:g}".replace(".", "p")
+            )
     return "_".join(parts)
 
 
@@ -277,6 +488,8 @@ def main() -> None:
     args = parse_args()
     if args.grad_accum_steps < 1:
         raise ValueError("--grad-accum-steps 必须 >= 1")
+    if args.init_from_v6_checkpoint and args.init_from_moe_checkpoint:
+        raise ValueError("--init-from-v6-checkpoint 和 --init-from-moe-checkpoint 只能二选一")
     if args.trace_no_graph:
         args.num_gat_layers = 0
 
@@ -358,6 +571,7 @@ def main() -> None:
 
     model = MultiModalServiceAwareMoE_RCAEval(config, adjacency_matrix).to(device)
     warm_start_info = None
+    moe_warm_start_info = None
     if args.init_from_v6_checkpoint:
         init_checkpoint = (PROJECT_ROOT / args.init_from_v6_checkpoint).resolve()
         if not init_checkpoint.exists():
@@ -369,11 +583,33 @@ def main() -> None:
         print(f"  loaded remapped keys: {warm_start_info['loaded_remapped']}")
         print(f"  skipped source keys: {len(warm_start_info['skipped_source_keys'])}")
         print(f"  missing target keys after load: {len(warm_start_info['missing_after_load'])}")
+    if args.init_from_moe_checkpoint:
+        init_checkpoint = (PROJECT_ROOT / args.init_from_moe_checkpoint).resolve()
+        if not init_checkpoint.exists():
+            raise FileNotFoundError(f"--init-from-moe-checkpoint 不存在: {init_checkpoint}")
+        moe_warm_start_info = load_moe_warm_start(model, init_checkpoint)
+        print("\n[MoE Warm Start]")
+        print(f"  source checkpoint: {moe_warm_start_info['source_checkpoint']}")
+        print(f"  source epoch: {moe_warm_start_info['source_epoch']}")
+        print(f"  source f1: {moe_warm_start_info['source_f1']}")
+        print(f"  missing target keys after load: {len(moe_warm_start_info['missing_after_load'])}")
+        print(f"  unexpected target keys after load: {len(moe_warm_start_info['unexpected_after_load'])}")
+
+    model.expose_training_outputs = args.window_loss_weight > 0 or args.boundary_loss_weight > 0
+    boundary_weights, boundary_stats = build_boundary_weight_map(train_loader.dataset, args)
+    if args.boundary_loss_weight > 0:
+        print("\n[Boundary Window Loss]")
+        print(f"  expose training outputs: {model.expose_training_outputs}")
+        print(f"  score method: {args.window_loss_score_method}")
+        print(f"  weighted samples: {boundary_stats.get('weighted_samples', 0)}")
+        print(f"  onset samples: {boundary_stats.get('onset_samples', 0)}")
+        print(f"  recovery samples: {boundary_stats.get('recovery_samples', 0)}")
 
     optimizer, optimizer_stats, trainable_params = build_optimizer(
         model,
         lr=args.lr,
         base_lr_scale=args.base_lr_scale,
+        finetune_scope=args.finetune_scope,
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
@@ -390,6 +626,7 @@ def main() -> None:
     patience_counter = 0
     run_name = summary_name(args)
     checkpoint_path = save_dir / "best_model.pth"
+    last_checkpoint_path = save_dir / "last_model.pth"
     summary_path = result_dir / f"{run_name}_summary.json"
 
     start_time = time.perf_counter()
@@ -400,7 +637,7 @@ def main() -> None:
     )
     optimizer.zero_grad(set_to_none=True)
 
-    if warm_start_info is not None:
+    if warm_start_info is not None or moe_warm_start_info is not None:
         initial_val_metrics = evaluate(model, val_loader, device, args, limit_batches=args.limit_eval_batches)
         initial_selected = initial_val_metrics["selected_metrics"]
         best_f1 = initial_selected["f1"]
@@ -415,6 +652,7 @@ def main() -> None:
                 "metadata": metadata,
                 "args": vars(args),
                 "warm_start": warm_start_info,
+                "moe_warm_start": moe_warm_start_info,
             },
             checkpoint_path,
         )
@@ -431,6 +669,8 @@ def main() -> None:
         epoch_cls = 0.0
         epoch_pred = 0.0
         epoch_moe = 0.0
+        epoch_window = 0.0
+        epoch_boundary = 0.0
         num_steps = 0
 
         pbar = tqdm(train_loader, desc=f"Eadro MoE {epoch}/{args.epochs}")
@@ -446,8 +686,20 @@ def main() -> None:
             gt_cls = convert_training_labels(gt_cls_raw, args.label_mode)
 
             loss, rec_loss, cls_loss, pred_loss = model(metrics, logs, traces, gt_cls)
+            extra_loss, extra_parts = compute_extra_window_losses(
+                model=model,
+                gt_cls_raw=gt_cls_raw,
+                case_names=[str(name) for name in batch["case_name"]],
+                boundary_weights=boundary_weights,
+                args=args,
+                device=device,
+            )
+            loss = loss + extra_loss
             scaled_loss = loss / args.grad_accum_steps
             scaled_loss.backward()
+            if hasattr(model, "latest_cls_probs"):
+                model.latest_cls_probs = None
+                model.latest_cls_logits = None
 
             should_step = ((batch_idx + 1) % args.grad_accum_steps == 0)
             limited_last = args.limit_train_batches > 0 and (batch_idx + 1) == args.limit_train_batches
@@ -463,16 +715,21 @@ def main() -> None:
             epoch_cls += float(cls_loss.item())
             epoch_pred += float(pred_loss.item())
             epoch_moe += moe_loss
+            epoch_window += extra_parts["window_loss"]
+            epoch_boundary += extra_parts["boundary_loss"]
             num_steps += 1
-            pbar.set_postfix(
-                {
-                    "loss": f"{loss.item():.4f}",
-                    "rec": f"{rec_loss.item():.4f}",
-                    "cls": f"{cls_loss.item():.4f}",
-                    "pred": f"{pred_loss.item():.4f}",
-                    "moe": f"{moe_loss:.4f}",
-                }
-            )
+            postfix = {
+                "loss": f"{loss.item():.4f}",
+                "rec": f"{rec_loss.item():.4f}",
+                "cls": f"{cls_loss.item():.4f}",
+                "pred": f"{pred_loss.item():.4f}",
+                "moe": f"{moe_loss:.4f}",
+            }
+            if args.window_loss_weight > 0:
+                postfix["win"] = f"{extra_parts['window_loss']:.4f}"
+            if args.boundary_loss_weight > 0:
+                postfix["bd"] = f"{extra_parts['boundary_loss']:.4f}"
+            pbar.set_postfix(postfix)
 
         scheduler.step()
         val_metrics = evaluate(model, val_loader, device, args, limit_batches=args.limit_eval_batches)
@@ -484,6 +741,8 @@ def main() -> None:
         avg_cls = epoch_cls / max(num_steps, 1)
         avg_pred = epoch_pred / max(num_steps, 1)
         avg_moe = epoch_moe / max(num_steps, 1)
+        avg_window = epoch_window / max(num_steps, 1)
+        avg_boundary = epoch_boundary / max(num_steps, 1)
         val_selected = val_metrics["selected_metrics"]
         val_root = val_metrics["root_service_metrics"]
         val_service_anomaly = val_metrics["service_anomaly_metrics"]
@@ -491,6 +750,7 @@ def main() -> None:
         print(
             f"Epoch {epoch}: "
             f"Loss={avg_loss:.4f}, Rec={avg_rec:.4f}, Cls={avg_cls:.4f}, Pred={avg_pred:.4f}, MoE={avg_moe:.4f}, "
+            f"Win={avg_window:.4f}, Bd={avg_boundary:.4f}, "
             f"Val[{val_metrics['selection_target']}] F1={val_selected['f1']:.4f}, "
             f"P={val_selected['precision']:.4f}, R={val_selected['recall']:.4f}, "
             f"RootF1={val_root['f1']:.4f}, ServiceAnomF1={val_service_anomaly['f1']:.4f}, "
@@ -510,15 +770,34 @@ def main() -> None:
                     "selection_target": val_metrics["selection_target"],
                     "metadata": metadata,
                     "args": vars(args),
+                    "warm_start": warm_start_info,
+                    "moe_warm_start": moe_warm_start_info,
                 },
                 checkpoint_path,
             )
             print(f"  [BEST] saved to {checkpoint_path}")
         else:
             patience_counter += 1
-            if patience_counter >= args.patience:
-                print(f"Early stopping at epoch {epoch}")
-                break
+
+        torch.save(
+            {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "config": config.__dict__,
+                "f1": val_selected["f1"],
+                "selection_target": val_metrics["selection_target"],
+                "metadata": metadata,
+                "args": vars(args),
+                "warm_start": warm_start_info,
+                "moe_warm_start": moe_warm_start_info,
+                "checkpoint_kind": "last",
+            },
+            last_checkpoint_path,
+        )
+
+        if patience_counter >= args.patience:
+            print(f"Early stopping at epoch {epoch}")
+            break
 
     if not checkpoint_path.exists():
         raise RuntimeError(f"训练未产生 checkpoint: {checkpoint_path}")
@@ -538,6 +817,7 @@ def main() -> None:
         "run_name": run_name,
         "elapsed_sec": elapsed_sec,
         "checkpoint_path": str(checkpoint_path),
+        "last_checkpoint_path": str(last_checkpoint_path),
         "data_dir": str(data_dir),
         "save_dir": str(save_dir),
         "result_dir": str(result_dir),
@@ -561,7 +841,9 @@ def main() -> None:
         },
         "config": vars(args),
         "warm_start": warm_start_info,
+        "moe_warm_start": moe_warm_start_info,
         "optimizer": optimizer_stats,
+        "boundary_weight_stats": boundary_stats,
     }
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
 

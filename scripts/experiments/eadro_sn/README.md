@@ -34,6 +34,7 @@
 - `online_service_aware_moe_eadro_runner.py`
   - `Eadro-SN` 隔离版 `service-aware MoE` realtime replay 入口
   - 自动从训练 summary/diagnostic 中恢复 `window_anomaly threshold`
+  - 支持 `--window-score-method max|top2_mean|top3_mean|max_times_top2_mean`，用于复现实验中的 validation-selected 窗口级后处理
   - 输出和当前 `V6` replay 对齐的 realtime 指标
 - `analyze_service_aware_moe_routing_eadro.py`
   - `Eadro-SN` 的 MoE routing diagnostics
@@ -147,4 +148,116 @@
   --pin-memory `
   --interval-ms 100 `
   --deadline-ms 100
+```
+
+### window postprocess calibration 示例
+
+```powershell
+& 'D:\anaconda\envs\paper_env\python.exe' `
+  scripts/experiments/eadro_sn/calibrate_service_aware_moe_window_postprocess.py `
+  --checkpoint checkpoints/eadro/experiments/moe_stage2/service_aware_eadro_sn_s42_warmv6_topk2_lr3e4_blr0p1_prior0p6_wo_logs/best_model.pth `
+  --batch-size 4 `
+  --num-workers 0 `
+  --device cuda `
+  --output-json results/experiments/eadro_sn/moe_stage2/service_aware_eadro_sn_s42_warmv6_topk2_lr3e4_blr0p1_prior0p6_wo_logs/window_postprocess_calibration.json
+```
+
+### temporal postprocess calibration 示例
+
+```powershell
+& 'D:\anaconda\envs\paper_env\python.exe' `
+  scripts/experiments/eadro_sn/calibrate_service_aware_moe_temporal_postprocess.py `
+  --checkpoint checkpoints/eadro/experiments/moe_stage2/service_aware_eadro_sn_s42_warmv6_topk2_lr3e4_blr0p1_prior0p6_wo_logs/best_model.pth `
+  --batch-size 4 `
+  --num-workers 0 `
+  --device cuda `
+  --top-k 20
+```
+
+完整 replay 复核 temporal 候选：
+
+```powershell
+$env:OMP_NUM_THREADS = '1'
+$env:MKL_NUM_THREADS = '1'
+$env:OPENBLAS_NUM_THREADS = '1'
+& 'D:\anaconda\envs\paper_env\python.exe' `
+  scripts/experiments/eadro_sn/online_service_aware_moe_eadro_runner.py `
+  --checkpoint checkpoints/eadro/experiments/moe_stage2/service_aware_eadro_sn_s42_warmv6_topk2_lr3e4_blr0p1_prior0p6_wo_logs/best_model.pth `
+  --device cuda `
+  --split test `
+  --max-steps 568 `
+  --warmup-samples 20 `
+  --threshold 0.36256143450737 `
+  --window-score-method top2_mean `
+  --temporal-postprocess confirm `
+  --temporal-window 2 `
+  --temporal-require 2 `
+  --interval-ms 100 `
+  --deadline-ms 100 `
+  --pace `
+  --prefetch
+```
+
+`confirm_or_high` 候选复核：
+
+```powershell
+$env:OMP_NUM_THREADS = '1'
+$env:MKL_NUM_THREADS = '1'
+$env:OPENBLAS_NUM_THREADS = '1'
+& 'D:\anaconda\envs\paper_env\python.exe' `
+  scripts/experiments/eadro_sn/online_service_aware_moe_eadro_runner.py `
+  --checkpoint checkpoints/eadro/experiments/moe_stage2/service_aware_eadro_sn_s42_warmv6_topk2_lr3e4_blr0p1_prior0p6_wo_logs/best_model.pth `
+  --device cuda `
+  --split test `
+  --max-steps 568 `
+  --warmup-samples 20 `
+  --threshold 0.3625 `
+  --window-score-method top2_mean `
+  --temporal-postprocess confirm_or_high `
+  --temporal-window 2 `
+  --temporal-require 2 `
+  --temporal-high-threshold 0.595 `
+  --interval-ms 100 `
+  --deadline-ms 100 `
+  --pace `
+  --prefetch
+```
+
+`confirm_or_high_maxlen` val-selected 候选复核：
+
+```powershell
+$env:OMP_NUM_THREADS = '1'
+$env:MKL_NUM_THREADS = '1'
+$env:OPENBLAS_NUM_THREADS = '1'
+& 'D:\anaconda\envs\paper_env\python.exe' `
+  scripts/experiments/eadro_sn/online_service_aware_moe_eadro_runner.py `
+  --checkpoint checkpoints/eadro/experiments/moe_stage2/service_aware_eadro_sn_s42_warmv6_topk2_lr3e4_blr0p1_prior0p6_wo_logs/best_model.pth `
+  --device cuda `
+  --split test `
+  --max-steps 568 `
+  --warmup-samples 20 `
+  --threshold 0.3675 `
+  --window-score-method top2_mean `
+  --temporal-postprocess confirm_or_high_maxlen `
+  --temporal-window 3 `
+  --temporal-require 2 `
+  --temporal-high-threshold 0.655 `
+  --temporal-max-active 24 `
+  --interval-ms 100 `
+  --deadline-ms 100 `
+  --pace `
+  --prefetch
+```
+
+结果：`F1=0.9698`, `P=0.9676`, `R=0.9721`, `miss@100ms=0.0%`, response `p99=60.28ms`, peak GPU memory `259.83MB`。
+参数来自 val 事件流搜索，不是 test 直接选参；写主表前仍建议补独立 seed / split 复核。
+
+剩余错误分析：
+
+```powershell
+& 'D:\anaconda\envs\paper_env\python.exe' `
+  scripts/experiments/eadro_sn/analyze_temporal_error_segments.py `
+  --summary-json results/experiments/eadro_sn/realtime_moe/service_aware_eadro_sn_s42_warmv6_topk2_lr3e4_blr0p1_prior0p6_wo_logs_test_20260427_130001_summary.json `
+  --events-jsonl results/experiments/eadro_sn/realtime_moe/service_aware_eadro_sn_s42_warmv6_topk2_lr3e4_blr0p1_prior0p6_wo_logs_test_20260427_130001_events.jsonl `
+  --output-json results/experiments/eadro_sn/realtime_moe/service_aware_eadro_sn_s42_warmv6_topk2_lr3e4_blr0p1_prior0p6_wo_logs_test_20260427_130001_error_analysis.json
 ```
