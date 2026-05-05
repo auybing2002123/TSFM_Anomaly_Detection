@@ -1,0 +1,319 @@
+{
+  "source_summary": "E:\\code\\paper\\code\\TSFM_Anomaly_Detection\\results\\experiments\\eadro_sn\\realtime_moe_top3_guarded_cleancheck\\service_aware_eadro_sn_s42_warmv6_topk2_lr3e4_blr0p1_prior0p6_wo_logs_test_20260427_163640_summary.json",
+  "source_events": "E:\\code\\paper\\code\\TSFM_Anomaly_Detection\\results\\experiments\\eadro_sn\\realtime_moe_top3_guarded_cleancheck\\service_aware_eadro_sn_s42_warmv6_topk2_lr3e4_blr0p1_prior0p6_wo_logs_test_20260427_163640_events.jsonl",
+  "main_result": {
+    "f1": 0.9837586956504325,
+    "precision": 0.9814814814360425,
+    "recall": 0.9860465115820443,
+    "accuracy": 0.9876760563380281,
+    "miss_rate_pct": 0.0,
+    "p99_ms": 60.13889999987443,
+    "max_ms": 83.91149999988556,
+    "gpu_peak_allocated_mb": 259.83,
+    "num_steps": 568
+  },
+  "multi_deadline_from_clean_trace": [
+    {
+      "deadline_ms": 25,
+      "miss_count": 365,
+      "miss_rate_pct": 64.26056338028168,
+      "p99_ms": 60.13889999987443,
+      "max_ms": 83.91149999988556,
+      "deadline_effective_metrics": {
+        "f1": 0.4347826086956521,
+        "precision": 0.9836065573770492,
+        "recall": 0.27906976744186046,
+        "accuracy": 0.7253521126760564,
+        "tp": 60,
+        "tn": 352,
+        "fp": 1,
+        "fn": 155
+      }
+    },
+    {
+      "deadline_ms": 50,
+      "miss_count": 21,
+      "miss_rate_pct": 3.697183098591549,
+      "p99_ms": 60.13889999987443,
+      "max_ms": 83.91149999988556,
+      "deadline_effective_metrics": {
+        "f1": 0.9669811320754716,
+        "precision": 0.9808612440191388,
+        "recall": 0.9534883720930233,
+        "accuracy": 0.9753521126760564,
+        "tp": 205,
+        "tn": 349,
+        "fp": 4,
+        "fn": 10
+      }
+    },
+    {
+      "deadline_ms": 75,
+      "miss_count": 1,
+      "miss_rate_pct": 0.17605633802816903,
+      "p99_ms": 60.13889999987443,
+      "max_ms": 83.91149999988556,
+      "deadline_effective_metrics": {
+        "f1": 0.9837587006960558,
+        "precision": 0.9814814814814815,
+        "recall": 0.986046511627907,
+        "accuracy": 0.9876760563380281,
+        "tp": 212,
+        "tn": 349,
+        "fp": 4,
+        "fn": 3
+      }
+    },
+    {
+      "deadline_ms": 100,
+      "miss_count": 0,
+      "miss_rate_pct": 0.0,
+      "p99_ms": 60.13889999987443,
+      "max_ms": 83.91149999988556,
+      "deadline_effective_metrics": {
+        "f1": 0.9837587006960558,
+        "precision": 0.9814814814814815,
+        "recall": 0.986046511627907,
+        "accuracy": 0.9876760563380281,
+        "tp": 212,
+        "tn": 349,
+        "fp": 4,
+        "fn": 3
+      }
+    },
+    {
+      "deadline_ms": 150,
+      "miss_count": 0,
+      "miss_rate_pct": 0.0,
+      "p99_ms": 60.13889999987443,
+      "max_ms": 83.91149999988556,
+      "deadline_effective_metrics": {
+        "f1": 0.9837587006960558,
+        "precision": 0.9814814814814815,
+        "recall": 0.986046511627907,
+        "accuracy": 0.9876760563380281,
+        "tp": 212,
+        "tn": 349,
+        "fp": 4,
+        "fn": 3
+      }
+    },
+    {
+      "deadline_ms": 200,
+      "miss_count": 0,
+      "miss_rate_pct": 0.0,
+      "p99_ms": 60.13889999987443,
+      "max_ms": 83.91149999988556,
+      "deadline_effective_metrics": {
+        "f1": 0.9837587006960558,
+        "precision": 0.9814814814814815,
+        "recall": 0.986046511627907,
+        "accuracy": 0.9876760563380281,
+        "tp": 212,
+        "tn": 349,
+        "fp": 4,
+        "fn": 3
+      }
+    }
+  ],
+  "trace_driven_overload_simulation": [
+    {
+      "interval_ms": 200,
+      "load_x": 0.5,
+      "deadline_ms": 100,
+      "miss_count": 0,
+      "miss_rate_pct": 0.0,
+      "throughput_windows_per_s": 5.0078586703850085,
+      "queue_delay": {
+        "mean_ms": 0.0,
+        "p95_ms": 0.0,
+        "p99_ms": 0.0,
+        "max_ms": 0.0
+      },
+      "response_latency": {
+        "mean_ms": 21.235266197173882,
+        "p95_ms": 36.940059999826914,
+        "p99_ms": 48.825029999686535,
+        "max_ms": 81.83240000016667
+      },
+      "processing_latency": {
+        "mean_ms": 21.235266197173832,
+        "p95_ms": 36.94005999982436,
+        "p99_ms": 48.82502999968894,
+        "max_ms": 81.83240000016667
+      }
+    },
+    {
+      "interval_ms": 100,
+      "load_x": 1.0,
+      "deadline_ms": 100,
+      "miss_count": 0,
+      "miss_rate_pct": 0.0,
+      "throughput_windows_per_s": 10.013798732574573,
+      "queue_delay": {
+        "mean_ms": 0.0,
+        "p95_ms": 0.0,
+        "p99_ms": 0.0,
+        "max_ms": 0.0
+      },
+      "response_latency": {
+        "mean_ms": 21.235266197173832,
+        "p95_ms": 36.94005999982436,
+        "p99_ms": 48.82502999968894,
+        "max_ms": 81.83240000016667
+      },
+      "processing_latency": {
+        "mean_ms": 21.235266197173832,
+        "p95_ms": 36.94005999982436,
+        "p99_ms": 48.82502999968894,
+        "max_ms": 81.83240000016667
+      }
+    },
+    {
+      "interval_ms": 50,
+      "load_x": 2.0,
+      "deadline_ms": 100,
+      "miss_count": 0,
+      "miss_rate_pct": 0.0,
+      "throughput_windows_per_s": 20.019927441015348,
+      "queue_delay": {
+        "mean_ms": 0.1997637323973988,
+        "p95_ms": 0.0,
+        "p99_ms": 4.972972000214243,
+        "max_ms": 41.848700000446115
+      },
+      "response_latency": {
+        "mean_ms": 21.43502992957123,
+        "p95_ms": 37.0967249997193,
+        "p99_ms": 54.97297200021424,
+        "max_ms": 91.84870000044612
+      },
+      "processing_latency": {
+        "mean_ms": 21.235266197173832,
+        "p95_ms": 36.94005999982436,
+        "p99_ms": 48.82502999968894,
+        "max_ms": 81.83240000016667
+      }
+    },
+    {
+      "interval_ms": 25,
+      "load_x": 4.0,
+      "deadline_ms": 100,
+      "miss_count": 26,
+      "miss_rate_pct": 4.577464788732395,
+      "throughput_windows_per_s": 40.009210007440494,
+      "queue_delay": {
+        "mean_ms": 13.534033450527922,
+        "p95_ms": 68.22704999868618,
+        "p99_ms": 172.8255619981119,
+        "max_ms": 193.50939999840193
+      },
+      "response_latency": {
+        "mean_ms": 34.76929964770175,
+        "p95_ms": 93.22704999868618,
+        "p99_ms": 197.82556199811188,
+        "max_ms": 218.50939999840193
+      },
+      "processing_latency": {
+        "mean_ms": 21.235266197173832,
+        "p95_ms": 36.94005999982436,
+        "p99_ms": 48.82502999968894,
+        "max_ms": 81.83240000016667
+      }
+    },
+    {
+      "interval_ms": 10,
+      "load_x": 10.0,
+      "deadline_ms": 100,
+      "miss_count": 563,
+      "miss_rate_pct": 99.11971830985915,
+      "throughput_windows_per_s": 47.09147465893734,
+      "queue_delay": {
+        "mean_ms": 3419.655603341094,
+        "p95_ms": 6087.052289993495,
+        "p99_ms": 6305.197597993864,
+        "max_ms": 6369.899999994304
+      },
+      "response_latency": {
+        "mean_ms": 3440.890869538268,
+        "p95_ms": 6112.529444993948,
+        "p99_ms": 6323.067082993966,
+        "max_ms": 6391.631199994736
+      },
+      "processing_latency": {
+        "mean_ms": 21.235266197173832,
+        "p95_ms": 36.94005999982436,
+        "p99_ms": 48.82502999968894,
+        "max_ms": 81.83240000016667
+      }
+    }
+  ],
+  "resource_efficiency_rows": [
+    {
+      "method": "Ours full",
+      "f1": 0.9837586956504325,
+      "miss_rate_pct": 0.0,
+      "p99_ms": 60.13889999987443,
+      "max_ms": 83.91149999988556,
+      "gpu_peak_allocated_mb": 259.83,
+      "num_steps": 568,
+      "source_summary": "E:\\code\\paper\\code\\TSFM_Anomaly_Detection\\results\\experiments\\eadro_sn\\realtime_moe_top3_guarded_cleancheck\\service_aware_eadro_sn_s42_warmv6_topk2_lr3e4_blr0p1_prior0p6_wo_logs_test_20260427_163640_summary.json"
+    },
+    {
+      "method": "w/o service prior",
+      "f1": 0.9720930182106003,
+      "miss_rate_pct": 0.528169014084507,
+      "p99_ms": 83.70252200445981,
+      "max_ms": 166.7516000015894,
+      "gpu_peak_allocated_mb": 259.83,
+      "num_steps": 568,
+      "source_summary": "E:\\code\\paper\\code\\TSFM_Anomaly_Detection\\results\\experiments\\eadro_sn\\final_ablation_20260428\\prior_sensitivity\\arch_no_service_prior_wo_logs_test_20260428_090737_summary.json"
+    },
+    {
+      "method": "w/o MoE / single shared",
+      "f1": 0.9151785663957869,
+      "miss_rate_pct": 0.0,
+      "p99_ms": 58.01580700033813,
+      "max_ms": 75.66229999792995,
+      "gpu_peak_allocated_mb": 261.53,
+      "num_steps": 568,
+      "source_summary": "E:\\code\\paper\\code\\TSFM_Anomaly_Detection\\results\\experiments\\eadro_sn\\final_ablation_20260427\\architecture\\v6_3layer_anomaly_label_wo_logs_top3_guarded_posthoc_summary.json"
+    },
+    {
+      "method": "rank2 small",
+      "f1": 0.9720930182106003,
+      "miss_rate_pct": 0.0,
+      "p99_ms": 80.60898800009461,
+      "max_ms": 99.97870000006515,
+      "gpu_peak_allocated_mb": 258.9,
+      "num_steps": 568,
+      "source_summary": "E:\\code\\paper\\code\\TSFM_Anomaly_Detection\\results\\experiments\\eadro_sn\\final_ablation_20260427\\efficiency_cleancheck\\efficiency_small_rank2_prior0p6_wo_logs_test_20260427_222153_summary.json"
+    },
+    {
+      "method": "rank8 large",
+      "f1": 0.9354120216933448,
+      "miss_rate_pct": 0.0,
+      "p99_ms": 70.45093800046749,
+      "max_ms": 91.66629999890574,
+      "gpu_peak_allocated_mb": 259.18,
+      "num_steps": 568,
+      "source_summary": "E:\\code\\paper\\code\\TSFM_Anomaly_Detection\\results\\experiments\\eadro_sn\\final_ablation_20260427\\efficiency_cleancheck\\efficiency_large_rank8_prior0p6_wo_logs_test_20260427_222431_summary.json"
+    },
+    {
+      "method": "XGBoost ensemble-64",
+      "f1": 0.9261744916100876,
+      "miss_rate_pct": 13.204225352112676,
+      "p99_ms": 757.8220369985502,
+      "max_ms": 812.6050999999279,
+      "gpu_peak_allocated_mb": null,
+      "num_steps": 568,
+      "source_summary": "E:\\code\\paper\\code\\TSFM_Anomaly_Detection\\results\\baselines\\xgboost_ensemble64_eadro_strict_s42_metrics_logs_traces_e500_d3\\full_replay_summary.json"
+    }
+  ],
+  "notes": [
+    "Multi-deadline is recomputed from the clean 568-step paced replay response_time_ms trace.",
+    "Deadline-effective metrics treat a late decision as no timely alert for that window.",
+    "Overload is a deterministic single-server replay simulation using measured per-window processing_ms from the clean run; it estimates queueing under shorter arrival intervals without rerunning the model.",
+    "CPU RSS was not recorded by the original replay runner; GPU peak allocated memory is available for CUDA runs."
+  ]
+}

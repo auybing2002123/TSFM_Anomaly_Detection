@@ -1,0 +1,54 @@
+\section{System Model and Problem Formulation}
+
+\subsection{Multimodal Observation Model}
+
+We consider a real-time multimodal diagnosis system deployed in cloud microservice environments. At each discrete time step \(t\), the system collects a heterogeneous set of observations within a sliding window
+
+\begin{equation}
+\mathcal{O}(t) = \{\mathcal{O}^{m}(t), \mathcal{O}^{l}(t), \mathcal{O}^{tr}(t)\},
+\end{equation}
+where $\mathcal{O}^{m}(t)$, $\mathcal{O}^{l}(t)$, and $\mathcal{O}^{tr}(t)$ denote metrics, logs, and traces, respectively.
+Together, they capture complementary facets of system behavior: metrics reflect resource usage patterns (e.g., CPU, memory, and network I/O), logs record semantic events and error messages, and traces encode request flows along with their service dependencies. The joint observation \(\mathcal{O}(t)\) thus serves as the input to the online diagnosis process.
+
+\subsection{Diagnosis Objective}
+
+Given the observation $\mathcal{O}(t)$, the diagnosis system aims to accomplish three interrelated tasks: anomaly detection, root cause analysis, and diagnosis explanation. Specifically, the system first determines whether the current state is abnormal, then identifies the root service responsible for the anomaly, and finally provides interpretable signals to support the diagnosis decision.
+
+These tasks must be performed in an online manner under strict real-time constraints. Each inference process, from feature extraction to final decision making, is required to complete within a predefined latency budget $D$, which is determined by the response requirements of the target cloud application.
+\subsection{Inference and Latency Model}
+
+We model the diagnosis process as a parametric inference function \(f\) that maps the observation \(\mathcal{O}(t)\) to a predicted diagnosis result \(\hat{y}(t)\):
+\[
+\hat{y}(t) = f(\mathcal{O}(t); k(t)),
+\]
+where \(k(t)\) is a control parameter denoting the number of activated experts in a mixture-of-experts (MoE) style architecture. The inference latency is assumed to be linear in \(k(t)\), taking the form
+\[
+T(t) = T_0 + \beta k(t),
+\]
+where \(T_0\) represents the fixed base latency (e.g., input processing and output aggregation) and \(\beta\) is the per-expert computational overhead. To satisfy the real-time requirement, the system must enforce
+\[
+T(t) \leq D,
+\]
+for every inference step \(t\).
+
+
+\subsection{Adaptive Inference Control}
+
+The variable $k(t)$ determines the computational cost of inference.
+The value of $k(t)$ is adaptively determined according to runtime conditions, enabling flexible control of inference cost under latency constraints.
+\textit{The variable $k(t)$ serves as a controllable inference knob that directly governs the trade-off between inference latency and diagnostic performance.}
+
+Larger $k(t)$ improves diagnostic accuracy by activating more experts, while smaller $k(t)$ reduces latency.
+
+\subsection{Problem Formulation}
+
+Our objective is to design an adaptive inference policy that selects $k(t)$ to maximize diagnostic performance under latency constraints:
+
+\begin{align}
+\max_{k(t)} \quad & \mathbb{E}[A(t)] \\
+\text{s.t.} \quad
+& T(t) \leq D, \\
+& k(t) \in \{1,2,\dots,K\}.
+\end{align}
+
+This formulation captures the fundamental trade-off between accuracy and real-time efficiency in online diagnosis systems.

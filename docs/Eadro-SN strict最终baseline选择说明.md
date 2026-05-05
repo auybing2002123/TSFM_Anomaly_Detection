@@ -18,6 +18,8 @@
 
 ## 2. 最终推荐 baseline 表
 
+表中的 `Ours` 对应论文方法 ASID 的完整在线配置：`Multimodal Encoding and Fusion` + `Deviation-Aware Temporal Modeling` + `Lightweight Frozen GPT-2 Backbone` + `Adaptive Sparse Inference / Context-Aware Sparse Adapter` + `Downstream Diagnosis Heads`。
+
 | 类别 | 方法 | Test F1 | Precision | Recall | miss@100ms | p99(ms) | 最终用途 |
 |---|---|---:|---:|---:|---:|---:|---|
 | Ours | `Service-aware MoE full modality + top3 guarded high` | **`0.9838`** | `0.9815` | `0.9860` | **`0.0%`** | `60.14` | 主结果 |

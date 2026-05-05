@@ -1,6 +1,6 @@
 # Eadro-SN strict 新数据集实验汇报
 
-更新时间：`2026-04-27`
+更新时间：`2026-04-28`
 
 ## 1. 文档目的
 
@@ -14,6 +14,7 @@
 - baseline realtime replay 对齐
 - baseline strengthening / feasibility probe
 - `Service-aware MoE` F1 冲高与窗口级后处理校准
+- RTSS Track 2 口径下的 deadline / overload / resource efficiency 补强证据
 
 不包含：
 
@@ -74,6 +75,7 @@
 | 预处理消融 | `trainsplit_service_minmax` | 已完成 |
 | 图结构消融 | `trace no-graph / raw adjacency / dense adjacency` | 已完成 |
 | runtime 消融 | `no prefetch / prefetch / prefetch+pin` | 已完成 |
+| RTSS Track 2 补强 | `multi-deadline miss / deadline-effective F1 / trace-driven overload / GPU peak memory` | 已完成 |
 | 外部 baseline | `XGBoost ensemble-64 / RBF-SVM ensemble-24 / XGBoost+RBF-SVM score ensemble / RBF-SVM ensemble / GDN-official / GDN-style / TraceAnomaly / TranAD / Anomaly Transformer` | 已完成 |
 | baseline replay | 上述六条 baseline 的 resident replay | 已完成 |
 | baseline strengthening | `TranAD/AT` 超参补强、ensemble、`GDN` strengthening、`MTAD-GAT`、`DeepTraLog` feasibility | 已完成 |
@@ -210,6 +212,38 @@
 - 干净环境复跑后，`0.9838` 候选已经拿到 `0 miss@100ms`，response `p99=60.14ms`、`max=83.91ms`，可升级为当前最强 realtime-passed 候选。
 - 更稳妥的论文写法是：`0.9838` 作为当前主候选，同时保留 `0.9698` 作为更早的 validation-selected 稳定参考，并在主表前补 repeat / seed 复核。
 - 继续冲更高 F1 的空间已经很窄：剩余 7 个错误高度接近边界/段落切换，下一步应优先做独立验证与 runtime 稳定性复跑，而不是扩大模型或引入明显 test-specific 的规则。
+
+### 4.6 RTSS Track 2 证据补强（2026-04-28）
+
+新增文档：[`Eadro-SN strict RTSS Track2补强评估.md`](E:/code/paper/code/TSFM_Anomaly_Detection/docs/Eadro-SN%20strict%20RTSS%20Track2补强评估.md)
+
+新增脚本：[`summarize_rtss_track2_evidence.py`](E:/code/paper/code/TSFM_Anomaly_Detection/scripts/experiments/eadro_sn/summarize_rtss_track2_evidence.py)
+
+新增结果：[`rtss_track2_evidence_summary.json`](E:/code/paper/code/TSFM_Anomaly_Detection/results/experiments/eadro_sn/rtss_track2_evidence/rtss_track2_evidence_summary.json)
+
+补强内容：
+
+- `multi-deadline miss`：从 clean `568-step` replay trace 重算 `25 / 50 / 75 / 100 / 150 / 200ms` deadline miss。
+- `deadline-effective F1`：把超时窗口视为没有及时告警，得到 RTSS 口径下的 accuracy-vs-deadline 曲线。
+- `trace-driven overload`：用 clean replay 的逐窗口 `processing_ms` 做单服务台排队仿真，得到 `0.5x / 1x / 2x / 4x / 10x` 到达压力下的 throughput、queue p99 和 miss rate。
+- `resource efficiency`：汇总主模型、结构消融、adapter rank 消融和 `XGBoost ensemble-64` 的 `F1 / miss@100ms / p99 / max / GPU peak`。
+
+关键结果：
+
+| 证据 | 结果 | 解释 |
+|---|---|---|
+| 主 deadline | `100ms: miss=0.00%, deadline-effective F1=0.9838` | 当前主模型满足完整 test replay 实时约束 |
+| 紧 deadline | `50ms: miss=3.70%, deadline-effective F1=0.9670` | deadline 收紧后退化较平滑 |
+| 过紧 deadline | `25ms: miss=64.26%, deadline-effective F1=0.4348` | 明确给出系统边界 |
+| `2x` overload | `interval=50ms: miss=0.00%, response p99=54.97ms` | 两倍到达压力下仍不 miss |
+| `4x` overload | `interval=25ms: miss=4.58%, response p99=197.83ms` | 开始出现排队导致的 tail latency 膨胀 |
+| GPU memory | `peak=259.83MB` | 主模型不是靠扩大显存换 F1 |
+
+阶段结论：
+
+- RTSS Track 2 的核心证据已经基本补齐：latency statistics、deadline miss ratio、accuracy-under-deadline、overload boundary 和 GPU memory 都有可追溯结果。
+- 当前还不能声称 strict WCET / formal hard real-time guarantee；更稳妥写法是 `empirical deadline compliance under measured platform`。
+- 当前仍缺 CPU RSS / CPU utilization 和 service-count scalability；这两项建议作为后续增强，而不是现在主结论的一部分。
 
 ## 5. 消融实验
 
@@ -393,6 +427,16 @@
 ### 5.7 最终论文消融表口径
 
 最终论文消融只采用下表这些变体。主结果统一写作 `Full`，对应 `warm-start Service-aware MoE + topk=2 + service prior=0.6 + metrics+logs+traces + top3_mean + confirm_or_high_guarded_top3`。
+
+与论文 Section IV 的模块命名对应如下：
+
+| 消融组 | 论文模块名称 | 对应创新点 |
+|---|---|---|
+| Architecture / Prior strength / Capacity | `Adaptive Sparse Inference` / `Context-Aware Sparse Adapter` | I3 |
+| Modality | `Multimodal Encoding and Fusion` + `Deviation-Aware Temporal Modeling` | I1 |
+| Backbone depth | `Lightweight Frozen GPT-2 Backbone` | I2 |
+| Decision | `Downstream Diagnosis Heads` / `Diagnosis Explanation` | I5 |
+| Runtime | RTSS 系统支撑，服务于在线任务模型和 deadline evidence | 不作为 I1-I5 模型创新 |
 
 | 消融组 | 变体 | F1 | Precision | Recall | Accuracy | miss@100ms | p99(ms) | 最终用途 |
 |---|---|---:|---:|---:|---:|---:|---:|---|
@@ -593,6 +637,8 @@
 - [Service-aware MoE val-selected max-active full replay](E:/code/paper/code/TSFM_Anomaly_Detection/results/experiments/eadro_sn/realtime_moe/service_aware_eadro_sn_s42_warmv6_topk2_lr3e4_blr0p1_prior0p6_wo_logs_test_20260427_141645_summary.json)
 - [Service-aware MoE top3 guarded 0.98 candidate replay](E:/code/paper/code/TSFM_Anomaly_Detection/results/experiments/eadro_sn/realtime_moe_top3_guarded/service_aware_eadro_sn_s42_warmv6_topk2_lr3e4_blr0p1_prior0p6_wo_logs_test_20260427_162406_summary.json)
 - [Service-aware MoE top3 guarded clean realtime replay](E:/code/paper/code/TSFM_Anomaly_Detection/results/experiments/eadro_sn/realtime_moe_top3_guarded_cleancheck/service_aware_eadro_sn_s42_warmv6_topk2_lr3e4_blr0p1_prior0p6_wo_logs_test_20260427_163640_summary.json)
+- [RTSS Track 2 evidence summary](E:/code/paper/code/TSFM_Anomaly_Detection/results/experiments/eadro_sn/rtss_track2_evidence/rtss_track2_evidence_summary.json)
+- [RTSS Track 2 evidence script](E:/code/paper/code/TSFM_Anomaly_Detection/scripts/experiments/eadro_sn/summarize_rtss_track2_evidence.py)
 - [Final ablation decision reruns](E:/code/paper/code/TSFM_Anomaly_Detection/results/experiments/eadro_sn/final_ablation_20260427/decision)
 - [Final ablation architecture reruns](E:/code/paper/code/TSFM_Anomaly_Detection/results/experiments/eadro_sn/final_ablation_20260427/architecture)
 - [Final ablation modality reruns](E:/code/paper/code/TSFM_Anomaly_Detection/results/experiments/eadro_sn/final_ablation_20260427/modality)

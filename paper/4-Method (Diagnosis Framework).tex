@@ -1,0 +1,105 @@
+\section{Adaptive Multimodal Diagnosis Framework}
+To solve the above optimization problem, we design a deviation-aware multimodal diagnosis framework with adaptive sparse inference, where the control variable $k(t)$ is realized through context-aware expert routing.
+\subsection{Overview}
+
+We propose a real-time multimodal anomaly detection and diagnosis framework, as illustrated in Fig.~\ref{fig:framework}. The framework consists of four main components:
+
+\begin{itemize}
+    \item multimodal encoding and fusion,
+    \item deviation-aware temporal modeling,
+    \item adaptive sparse inference,
+    \item downstream diagnosis heads.
+\end{itemize}
+
+The key idea is to construct a shared deviation representation that captures abnormal system dynamics and supports multiple diagnosis tasks.
+
+\subsection{Multimodal Encoding and Fusion}
+
+Each modality is encoded separately:
+
+\begin{equation}
+\mathbf{h}^{m}(t) = f^{m}(\mathcal{O}^{m}(t)), \quad
+\mathbf{h}^{l}(t) = f^{l}(\mathcal{O}^{l}(t)), \quad
+\mathbf{h}^{tr}(t) = f^{tr}(\mathcal{O}^{tr}(t)).
+\end{equation}
+
+The encoded features are fused into a unified sequence:
+
+\begin{equation}
+\mathbf{h}(t) = \text{Fusion}(\mathbf{h}^{m}(t), \mathbf{h}^{l}(t), \mathbf{h}^{tr}(t)).
+\end{equation}
+
+\subsection{Deviation-Aware Temporal Modeling}
+
+We adopt a lightweight frozen GPT-2 backbone to model temporal dependencies and predict future system states.
+
+Given the hidden state at time $t-1$, we predict:
+
+\begin{equation}
+\hat{\mathbf{h}}(t) = \text{Backbone}(\mathbf{h}(t-1)).
+\end{equation}
+
+We define the deviation representation as:
+
+\begin{equation}
+\mathbf{d}(t) = \hat{\mathbf{h}}(t) - \mathbf{h}(t).
+\end{equation}
+
+This deviation captures abnormal behavior and serves as a shared representation for downstream diagnosis tasks.
+\subsection{Adaptive Sparse Inference}
+
+To improve efficiency, we introduce a context-aware sparse adapter based on a mixture-of-experts (MoE) architecture.
+
+Given deviation feature $\mathbf{d}(t)$, we select a subset of experts:
+
+\begin{equation}
+\mathcal{E}(t) = \text{Top-}k(g(\mathbf{d}(t))),
+\end{equation}
+
+where $k$ denotes the number of activated experts.
+
+The final representation is:
+
+\begin{equation}
+\mathbf{z}(t) = \sum_{i \in \mathcal{E}(t)} \pi_i(t) E_i(\mathbf{d}(t)).
+\end{equation}
+
+\textbf{Latency-aware control.}
+We model the inference latency as:
+
+\begin{equation}
+T(t) = T_0 + \beta k(t),
+\end{equation}
+
+\textit{The variable $k(t)$ serves as a controllable inference knob that enables latency-aware diagnosis.}
+\subsection{Diagnosis Heads}
+
+The shared representation $\mathbf{z}(t)$ is used for three tasks:
+
+\textbf{Anomaly detection:}
+\begin{equation}
+y(t) = \sigma(W_a \mathbf{z}(t)).
+\end{equation}
+
+\textbf{Root cause analysis:}
+We disentangle rootness and victimness:
+\begin{equation}
+s_{root} = f_r(\mathbf{z}), \quad s_{victim} = f_v(\mathbf{z}),
+\end{equation}
+\begin{equation}
+\text{RCA score} = s_{root} - s_{victim}.
+\end{equation}
+
+\textbf{Diagnosis explanation:}
+We output interpretable signals across modalities, time, and services.
+
+\subsection{Discussion}
+
+The proposed framework enables:
+
+\begin{itemize}
+    \item unified multimodal representation,
+    \item efficient sparse inference,
+    \item controllable latency-aware diagnosis,
+    \item interpretable root cause analysis.
+\end{itemize}
