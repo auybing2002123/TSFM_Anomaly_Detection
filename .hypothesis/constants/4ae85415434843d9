@@ -1,4 +1,0 @@
-# file: E:\code\paper\code\TSFM_Anomaly_Detection\configs\lora_config.py
-# hypothesis_version: 6.150.0
-
-[0.0, 0.1, 1.0, 16.0, 256, 'DALoRAConfig', 'FullLoRAConfig', 'LoRAConfig', 'all', 'alpha', 'bias', 'coral', 'domain_alignment', 'dropout', 'enabled', 'k', 'kernel', 'lambda', 'lambda_weight', 'linear', 'lora', 'lora_only', 'method', 'mmd', 'none', 'o', 'q', 'r', 'rank', 'rbf', 'target_modules', 'utf-8', 'v', 'w', 'wi', 'wo']

@@ -1,4 +1,0 @@
-# file: E:\code\paper\code\TSFM_Anomaly_Detection\utils\losses.py
-# hypothesis_version: 6.150.0
-
-[1.0, 'mean', 'pred_loss', 'recon_loss', 'total_loss']

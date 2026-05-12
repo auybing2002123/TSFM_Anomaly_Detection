@@ -1,4 +1,0 @@
-# file: E:\code\paper\code\TSFM_Anomaly_Detection\utils\metrics.py
-# hypothesis_version: 6.150.0
-
-[0.0, 100, 'auc_pr', 'auc_roc', 'best_score', 'best_threshold', 'f1', 'precision', 'recall', 'threshold']

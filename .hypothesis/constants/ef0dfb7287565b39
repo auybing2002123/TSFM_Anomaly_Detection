@@ -1,4 +1,0 @@
-# file: E:\code\paper\code\TSFM_Anomaly_Detection\models\tsfm_ad.py
-# hypothesis_version: 6.150.0
-
-[0.0, 0.1, 1.0, 100, 256, '=', 'LoRA Statistics:', 'LoRA is not enabled', 'anomaly_loss', 'anomaly_score', 'attention', 'backbone', 'backbone_total', 'backbone_trainable', 'cache', 'cache_dir', 'checkpoint_type', 'config', 'cpu', 'data', 'disabled', 'domain_loss', 'dropout', 'embeddings', 'enabled', 'epoch', 'freeze_backbone', 'fusion_learnable', 'head_total', 'head_trainable', 'hidden_dim', 'lora', 'lora_alpha', 'lora_config', 'lora_num_layers', 'lora_rank', 'lora_ratio', 'lora_ratio_percent', 'lora_state_dict', 'lora_total', 'loss_lambda', 'metrics', 'model', 'n_features', 'num_layers', 'optimizer_state_dict', 'paths', 'pooling', 'pred', 'pred_loss', 'pred_score', 'recon', 'recon_loss', 'recon_score', 'threshold', 'total', 'total_loss', 'trainable', 'training', 'window_size']

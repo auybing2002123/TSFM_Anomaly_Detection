@@ -1,4 +1,0 @@
-# file: E:\code\paper\code\TSFM_Anomaly_Detection\utils\__init__.py
-# hypothesis_version: 6.150.0
-
-['AnomalyDetectionLoss', 'DomainAlignmentLoss', 'compute_metrics', 'point_adjusted_f1']

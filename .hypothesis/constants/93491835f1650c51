@@ -1,4 +1,0 @@
-# file: E:\code\paper\code\TSFM_Anomaly_Detection\data\parsers\__init__.py
-# hypothesis_version: 6.150.0
-
-['BaseParser', 'MSLSMAPParser', 'PSMParser', 'SMDParser']

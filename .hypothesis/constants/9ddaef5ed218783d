@@ -1,4 +1,0 @@
-# file: E:\code\paper\code\TSFM_Anomaly_Detection\data\parsers\psm.py
-# hypothesis_version: 6.150.0
-
-['PSM', 'columns', 'feature_names', 'label', 'metadata', 'test.csv', 'test_data', 'test_label.csv', 'test_labels', 'timestamp_(min)', 'train.csv', 'train_data']
