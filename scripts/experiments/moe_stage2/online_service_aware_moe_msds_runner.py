@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import time
 from pathlib import Path
 import sys
@@ -20,6 +22,7 @@ from scripts.experiments.moe_stage2.service_aware_moe_config import (  # noqa: E
 from scripts.experiments.moe_stage2.service_aware_moe_model import (  # noqa: E402
     MultiModalServiceAwareMoE_MSDS,
     build_adjacency_from_mode,
+    iter_service_aware_moe_layers,
 )
 from scripts.realtime.common import (  # noqa: E402
     RuntimeBundle,
@@ -49,6 +52,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-samples", type=int, default=3)
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--precision", choices=["fp32", "fp16", "bf16"], default="fp32")
+    parser.add_argument("--dynamic-router-budget", choices=["fixed", "confidence"], default="fixed")
+    parser.add_argument("--dynamic-min-topk", type=int, default=1)
+    parser.add_argument("--dynamic-max-topk", type=int, default=2)
+    parser.add_argument("--dynamic-confidence-threshold", type=float, default=1.0)
     parser.add_argument("--interval-ms", type=float, default=0.0)
     parser.add_argument("--deadline-ms", type=float, default=0.0)
     parser.add_argument("--pace", action="store_true")
@@ -81,7 +88,8 @@ def load_runtime_bundle_service_aware_msds(
     if not data_path.is_absolute():
         data_path = (PROJECT_ROOT / data_path).resolve()
 
-    splits = load_msds_temporal_split(str(data_path))
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        splits = load_msds_temporal_split(str(data_path))
     dataset = splits[split]
     metadata = dict(splits["full"].get_metadata())
     checkpoint_data = torch.load(checkpoint_path, map_location=device)
@@ -112,6 +120,81 @@ def load_runtime_bundle_service_aware_msds(
     )
 
 
+def configure_router_budget(
+    model: torch.nn.Module,
+    *,
+    mode: str,
+    min_topk: int,
+    max_topk: int,
+    confidence_threshold: float,
+) -> None:
+    for layer in iter_service_aware_moe_layers(model):
+        layer.set_router_budget_policy(
+            mode=mode,
+            min_topk=min_topk,
+            max_topk=max_topk,
+            confidence_threshold=confidence_threshold,
+        )
+
+
+def collect_router_budget_event(model: torch.nn.Module) -> dict[str, Any]:
+    selected = []
+    for layer in iter_service_aware_moe_layers(model):
+        if layer.last_router_selected_k is not None:
+            selected.append(layer.last_router_selected_k.detach().float().cpu())
+    if not selected:
+        return {}
+
+    values = torch.cat(selected)
+    unique, counts = torch.unique(values.to(torch.int64), return_counts=True)
+    return {
+        "avg_selected_k": float(values.mean().item()),
+        "selected_k_count": int(values.numel()),
+        "selected_k_histogram": {str(int(k.item())): int(v.item()) for k, v in zip(unique, counts)},
+    }
+
+
+def update_detection_counts(
+    counts: dict[str, int],
+    event: dict[str, Any],
+    service_names: list[str],
+) -> None:
+    predicted = set(event.get("predicted_anomalies", []))
+    actual = set(event.get("true_anomalies", []))
+    for service in service_names:
+        pred = service in predicted
+        label = service in actual
+        if pred and label:
+            counts["tp"] += 1
+        elif pred and not label:
+            counts["fp"] += 1
+        elif not pred and label:
+            counts["fn"] += 1
+        else:
+            counts["tn"] += 1
+
+
+def summarize_detection_counts(counts: dict[str, int]) -> dict[str, float | int]:
+    tp = counts["tp"]
+    tn = counts["tn"]
+    fp = counts["fp"]
+    fn = counts["fn"]
+    precision = tp / (tp + fp + 1e-8)
+    recall = tp / (tp + fn + 1e-8)
+    f1 = 2 * precision * recall / (precision + recall + 1e-8)
+    accuracy = (tp + tn) / (tp + tn + fp + fn + 1e-8)
+    return {
+        "f1": f1,
+        "precision": precision,
+        "recall": recall,
+        "accuracy": accuracy,
+        "tp": tp,
+        "tn": tn,
+        "fp": fp,
+        "fn": fn,
+    }
+
+
 def print_step(record: dict[str, Any]) -> None:
     root = record["root_cause_service"] or "normal"
     state = "OK" if record["deadline_met"] else "MISS"
@@ -131,9 +214,17 @@ def main() -> int:
     args = parse_args()
     device = resolve_device(args.device)
     bundle = load_runtime_bundle_service_aware_msds(args.split, args.checkpoint, args.data_dir, device)
+    configure_router_budget(
+        bundle.model,
+        mode=args.dynamic_router_budget,
+        min_topk=args.dynamic_min_topk,
+        max_topk=args.dynamic_max_topk,
+        confidence_threshold=args.dynamic_confidence_threshold,
+    )
 
     available = max(0, len(bundle.dataset) - args.start_index)
-    max_steps = min(args.max_steps, available)
+    requested_steps = available if args.max_steps <= 0 else args.max_steps
+    max_steps = min(requested_steps, available)
     if max_steps <= 0:
         print("没有可用于回放的样本，请检查 --start-index 或数据集长度。")
         return 1
@@ -153,6 +244,13 @@ def main() -> int:
         f"Pace={args.pace}, Prefetch={args.prefetch}, PinMemory={args.pin_memory}"
     )
     print(f"Precision: {args.precision}")
+    print(
+        "Router budget: "
+        f"mode={args.dynamic_router_budget}, "
+        f"min_topk={args.dynamic_min_topk}, "
+        f"max_topk={args.dynamic_max_topk}, "
+        f"confidence_threshold={args.dynamic_confidence_threshold:.4f}"
+    )
 
     prefetched_batches = None
     prefetch_wall_ms = 0.0
@@ -181,6 +279,10 @@ def main() -> int:
         torch.cuda.reset_peak_memory_stats(bundle.device)
 
     events = []
+    detection_counts = {"tp": 0, "tn": 0, "fp": 0, "fn": 0}
+    selected_k_sum = 0.0
+    selected_k_count = 0
+    selected_k_histogram: dict[str, int] = {}
     interval_s = interval_ms / 1000.0
     base_release = time.perf_counter()
     for step in range(max_steps):
@@ -216,14 +318,20 @@ def main() -> int:
             "deadline_met": response_time_ms <= deadline_ms,
             **record,
         }
+        budget_event = collect_router_budget_event(bundle.model)
+        if budget_event:
+            event.update(budget_event)
+            selected_k_sum += float(budget_event["avg_selected_k"]) * int(budget_event["selected_k_count"])
+            selected_k_count += int(budget_event["selected_k_count"])
+            for key, value in budget_event["selected_k_histogram"].items():
+                selected_k_histogram[key] = selected_k_histogram.get(key, 0) + int(value)
+        update_detection_counts(detection_counts, event, bundle.service_names)
         events.append(event)
 
-        if (
-            args.print_every <= 1
-            or step == 0
-            or (step + 1) % args.print_every == 0
-            or step == max_steps - 1
-        ):
+        should_print = step == 0 or step == max_steps - 1
+        if args.print_every > 0:
+            should_print = should_print or (step + 1) % args.print_every == 0
+        if should_print:
             print_step(event)
 
     deadline_misses = sum(1 for event in events if not event["deadline_met"])
@@ -257,6 +365,16 @@ def main() -> int:
         "precision": args.precision,
         "deadline_miss_count": deadline_misses,
         "deadline_miss_rate_pct": deadline_misses / max_steps * 100.0,
+        "detection_metrics": summarize_detection_counts(detection_counts),
+        "router_budget": {
+            "mode": args.dynamic_router_budget,
+            "min_topk": args.dynamic_min_topk,
+            "max_topk": args.dynamic_max_topk,
+            "confidence_threshold": args.dynamic_confidence_threshold,
+            "avg_selected_k": selected_k_sum / selected_k_count if selected_k_count > 0 else None,
+            "selected_k_count": selected_k_count,
+            "selected_k_histogram": selected_k_histogram,
+        },
         "processing_latency": processing_stats,
         "response_latency": response_stats,
     }
@@ -275,6 +393,19 @@ def main() -> int:
     print(f"Precision    : {summary['precision']}")
     print(f"Steps        : {summary['num_steps']}")
     print(f"Miss Rate    : {summary['deadline_miss_rate_pct']:.2f}%")
+    det = summary["detection_metrics"]
+    print(
+        "Detection    : "
+        f"F1={det['f1']:.4f}  "
+        f"P={det['precision']:.4f}  "
+        f"R={det['recall']:.4f}  "
+        f"Acc={det['accuracy']:.4f}"
+    )
+    print(
+        "Budget       : "
+        f"avg_k={summary['router_budget']['avg_selected_k'] if summary['router_budget']['avg_selected_k'] is not None else 'N/A'}  "
+        f"hist={summary['router_budget']['selected_k_histogram']}"
+    )
     print(
         "Response     : "
         f"mean={summary['response_latency']['response_time_ms']['mean_ms']:.2f} ms  "

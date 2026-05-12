@@ -64,13 +64,88 @@ class MoELoRALayer(nn.Module):
             nn.GELU(),
             nn.Linear(router_hidden, num_experts),
         )
+        self.router_budget_mode = "fixed"
+        self.router_min_topk = self.router_topk
+        self.router_max_topk = self.router_topk
+        self.router_confidence_threshold = 1.0
 
         for expert_a, expert_b in zip(self.experts_A, self.experts_B):
             nn.init.kaiming_uniform_(expert_a.weight, a=5**0.5)
             nn.init.zeros_(expert_b.weight)
 
         self.last_router_probs: Optional[torch.Tensor] = None
+        self.last_router_dense_probs: Optional[torch.Tensor] = None
+        self.last_router_selected_k: Optional[torch.Tensor] = None
         self._router_probs_for_loss: Optional[torch.Tensor] = None
+        self.dense_expert_serving = False
+
+    def set_router_budget_policy(
+        self,
+        *,
+        mode: str = "fixed",
+        min_topk: Optional[int] = None,
+        max_topk: Optional[int] = None,
+        confidence_threshold: float = 1.0,
+    ) -> None:
+        normalized = mode.lower()
+        if normalized not in {"fixed", "confidence"}:
+            raise ValueError(f"Unsupported router budget mode: {mode}")
+        self.router_budget_mode = normalized
+        if min_topk is not None:
+            self.router_min_topk = max(1, min(int(min_topk), self.num_experts))
+        if max_topk is not None:
+            self.router_max_topk = max(1, min(int(max_topk), self.num_experts))
+        if self.router_min_topk > self.router_max_topk:
+            self.router_min_topk, self.router_max_topk = self.router_max_topk, self.router_min_topk
+        self.router_confidence_threshold = float(confidence_threshold)
+
+    def _apply_router_budget(self, router_probs: torch.Tensor) -> torch.Tensor:
+        if self.router_budget_mode == "confidence":
+            min_topk = max(1, min(int(self.router_min_topk), self.num_experts))
+            max_topk = max(min_topk, min(int(self.router_max_topk), self.num_experts))
+            top1_conf = router_probs.max(dim=-1).values
+            selected_k = torch.where(
+                top1_conf >= self.router_confidence_threshold,
+                torch.full_like(top1_conf, min_topk, dtype=torch.long),
+                torch.full_like(top1_conf, max_topk, dtype=torch.long),
+            )
+
+            if min_topk == 1 and max_topk == 2:
+                values, indices = torch.topk(router_probs, k=2, dim=-1)
+                keep_second = (selected_k >= 2).to(router_probs.dtype).unsqueeze(-1)
+                values = torch.cat([values[:, :1], values[:, 1:2] * keep_second], dim=-1)
+                sparse = torch.zeros_like(router_probs)
+                sparse.scatter_(1, indices, values)
+            else:
+                sparse = torch.zeros_like(router_probs)
+                for k_int in range(min_topk, max_topk + 1):
+                    mask = selected_k == k_int
+                    values, indices = torch.topk(router_probs, k=k_int, dim=-1)
+                    values = values * mask.to(router_probs.dtype).unsqueeze(-1)
+                    sparse.scatter_add_(1, indices, values)
+            self.last_router_selected_k = selected_k.detach()
+            return sparse / sparse.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+        if 0 < self.router_topk < self.num_experts:
+            values, indices = torch.topk(router_probs, k=self.router_topk, dim=-1)
+            sparse = torch.zeros_like(router_probs)
+            sparse.scatter_(1, indices, values)
+            router_probs = sparse / sparse.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+            self.last_router_selected_k = torch.full(
+                (router_probs.shape[0],),
+                int(self.router_topk),
+                dtype=torch.long,
+                device=router_probs.device,
+            )
+            return router_probs
+
+        self.last_router_selected_k = torch.full(
+            (router_probs.shape[0],),
+            int(self.num_experts),
+            dtype=torch.long,
+            device=router_probs.device,
+        )
+        return router_probs
 
     def _route(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 3:
@@ -80,11 +155,8 @@ class MoELoRALayer(nn.Module):
 
         router_logits = self.router(pooled) / self.router_temperature
         router_probs = torch.softmax(router_logits, dim=-1)
-        if 0 < self.router_topk < self.num_experts:
-            values, indices = torch.topk(router_probs, k=self.router_topk, dim=-1)
-            sparse = torch.zeros_like(router_probs)
-            sparse.scatter_(1, indices, values)
-            router_probs = sparse / sparse.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        self.last_router_dense_probs = router_probs.detach()
+        router_probs = self._apply_router_budget(router_probs)
         self._router_probs_for_loss = router_probs
         self.last_router_probs = router_probs.detach()
         return router_probs
@@ -94,6 +166,18 @@ class MoELoRALayer(nn.Module):
         router_probs = self._route(x)
         dropped = self.lora_dropout(x)
         moe_delta = torch.zeros_like(original_out)
+
+        if self.dense_expert_serving:
+            for expert_idx, (expert_a, expert_b) in enumerate(zip(self.experts_A, self.experts_B)):
+                expert_out = expert_b(expert_a(dropped)) * self.scaling
+                expert_weight = router_probs[:, expert_idx]
+                if x.dim() == 3:
+                    expert_out = expert_out * expert_weight.view(-1, 1, 1)
+                else:
+                    expert_out = expert_out * expert_weight.view(-1, 1)
+                moe_delta = moe_delta + expert_out
+            return original_out + moe_delta
+
         for expert_idx, (expert_a, expert_b) in enumerate(zip(self.experts_A, self.experts_B)):
             expert_weight = router_probs[:, expert_idx]
             active_mask = expert_weight > 0

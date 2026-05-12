@@ -24,9 +24,24 @@ def parse_args() -> argparse.Namespace:
         default=PROJECT_ROOT / "artifacts" / "baselines" / "eadro_sn_strict_protocol_s42",
     )
     parser.add_argument("--output-json", type=Path, required=True)
+    parser.add_argument(
+        "--output-events-jsonl",
+        type=Path,
+        default=None,
+        help="Optional per-step replay event log used for paper latency CDF figures.",
+    )
     parser.add_argument("--num-steps", type=int, default=568)
     parser.add_argument("--interval-ms", type=float, default=100.0)
     parser.add_argument("--deadline-ms", type=float, default=100.0)
+    parser.add_argument(
+        "--predict-mode",
+        choices=["sklearn_proba", "booster_inplace"],
+        default="sklearn_proba",
+        help=(
+            "sklearn_proba uses the original XGBClassifier.predict_proba path; "
+            "booster_inplace uses the lower-overhead Booster.inplace_predict path."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -85,12 +100,23 @@ def latency_stats(values: list[float]) -> dict[str, float | int]:
     }
 
 
+def predict_ensemble_score(models: list[Any], row: np.ndarray, mode: str) -> float:
+    if mode == "booster_inplace":
+        scores = []
+        for model in models:
+            booster = model.get_booster()
+            pred = booster.inplace_predict(row, validate_features=False)
+            scores.append(float(np.asarray(pred, dtype=np.float64).reshape(-1)[0]))
+        return float(np.mean(scores))
+    return float(np.mean([model.predict_proba(row)[:, 1] for model in models], axis=0)[0])
+
+
 def main() -> None:
     args = parse_args()
     summary_path = resolve(args.summary_json)
     summary = load_json(summary_path)
     test = dict(np.load(args.export_dir / "test.npz", allow_pickle=True))
-    features = build_features(test, summary["representation"])
+    features = np.ascontiguousarray(build_features(test, summary["representation"]), dtype=np.float32)
     labels = test["window_labels"].astype(np.int64)
     threshold = float(summary["validation_selection"]["threshold"])
 
@@ -99,13 +125,14 @@ def main() -> None:
         with resolve(Path(item["checkpoint_pickle"])).open("rb") as handle:
             models.append(pickle.load(handle))
 
-    for model in models[: min(3, len(models))]:
-        _ = model.predict_proba(features[:1])[:, 1]
+    for _ in range(3):
+        _ = predict_ensemble_score(models, features[:1], args.predict_mode)
 
     steps = min(args.num_steps, labels.shape[0])
     scores: list[float] = []
     processing_ms: list[float] = []
     response_ms: list[float] = []
+    events: list[dict[str, Any]] = []
 
     start = time.perf_counter()
     for step in range(steps):
@@ -115,12 +142,29 @@ def main() -> None:
             time.sleep(scheduled - now)
 
         begin = time.perf_counter()
-        score = float(np.mean([model.predict_proba(features[step : step + 1])[:, 1] for model in models], axis=0)[0])
+        row = features[step : step + 1]
+        score = predict_ensemble_score(models, row, args.predict_mode)
         end = time.perf_counter()
 
         scores.append(score)
-        processing_ms.append((end - begin) * 1000.0)
-        response_ms.append((end - scheduled) * 1000.0)
+        current_processing_ms = (end - begin) * 1000.0
+        current_response_ms = (end - scheduled) * 1000.0
+        current_prediction = int(score >= threshold)
+        current_label = int(labels[step])
+        processing_ms.append(current_processing_ms)
+        response_ms.append(current_response_ms)
+        events.append(
+            {
+                "step": step,
+                "score": score,
+                "label": current_label,
+                "prediction": current_prediction,
+                "processing_ms": current_processing_ms,
+                "response_time_ms": current_response_ms,
+                "deadline_ms": args.deadline_ms,
+                "deadline_met": current_response_ms <= args.deadline_ms,
+            }
+        )
 
         if step in {0, steps - 1}:
             print(
@@ -138,6 +182,15 @@ def main() -> None:
         "source_summary": str(summary_path),
         "representation": summary["representation"],
         "params": summary.get("params", {}),
+        "serving_optimization": {
+            "predict_mode": args.predict_mode,
+            "resident_models": True,
+            "resident_features": True,
+            "notes": (
+                "booster_inplace avoids per-step sklearn probability wrapper overhead "
+                "while preserving the trained XGBoost trees and online batch size one."
+            ),
+        },
         "mode": "paced_replay",
         "num_steps": steps,
         "interval_ms": args.interval_ms,
@@ -154,6 +207,12 @@ def main() -> None:
     output_path = resolve(args.output_json)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(replay_summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    if args.output_events_jsonl is not None:
+        events_path = resolve(args.output_events_jsonl)
+        events_path.parent.mkdir(parents=True, exist_ok=True)
+        with events_path.open("w", encoding="utf-8") as handle:
+            for event in events:
+                handle.write(json.dumps(event, ensure_ascii=False) + "\n")
 
     latency = replay_summary["response_latency"]["response_time_ms"]
     metrics = replay_summary["replay_detection_metrics"]
@@ -163,6 +222,8 @@ def main() -> None:
         f"p99={latency['p99_ms']:.2f}ms, max={latency['max_ms']:.2f}ms"
     )
     print(f"Summary: {output_path}")
+    if args.output_events_jsonl is not None:
+        print(f"Events : {resolve(args.output_events_jsonl)}")
 
 
 if __name__ == "__main__":

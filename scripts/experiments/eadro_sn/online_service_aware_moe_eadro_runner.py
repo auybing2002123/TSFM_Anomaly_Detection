@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import contextlib
+import ctypes
+import gc
+import importlib
 import io
+import os
 import time
 from pathlib import Path
 import sys
@@ -20,11 +25,16 @@ from scripts.experiments.eadro_sn.eadro_sn_lazy_loader import (  # noqa: E402
     create_eadro_sn_lazy_dataloaders,
 )
 from scripts.experiments.eadro_sn.online_v6_eadro_replay_runner import (  # noqa: E402
+    configure_matmul_precision,
     compute_binary_metrics,
     infer_artifact_paths,
     load_json,
     maybe_disable_modalities,
+    extract_true_abnormal_services,
+    extract_true_root_services,
+    move_prefetched_batches_to_device,
     print_step,
+    set_replay_amp_dtype,
     resolve_path,
     resolve_window_threshold,
     run_eadro_inference,
@@ -37,15 +47,19 @@ from scripts.experiments.moe_stage2.service_aware_moe_config import (  # noqa: E
     ServiceAwareMoERCAEvalConfig,
 )
 from scripts.experiments.moe_stage2.service_aware_moe_model import (  # noqa: E402
+    ServiceAwareMoELoRALayer,
     MultiModalServiceAwareMoE_RCAEval,
+    enable_graph_safe_gpt2_forward,
 )
 from scripts.realtime.common import (  # noqa: E402
     RuntimeBundle,
+    SampleBatch,
     add_cuda_memory_summary,
     build_run_metadata,
     ensure_dir,
     percentile,
     prefetch_sample_batches,
+    resolve_amp_dtype,
     save_json,
     save_jsonl,
     summarize_latency_records,
@@ -112,6 +126,147 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pace", action="store_true")
     parser.add_argument("--prefetch", action="store_true")
     parser.add_argument("--pin-memory", action="store_true")
+    parser.add_argument(
+        "--prefetch-device",
+        choices=["cpu", "cuda"],
+        default="cpu",
+        help="Keep prefetched replay samples on CPU or move them to the CUDA device before replay.",
+    )
+    parser.add_argument(
+        "--gpu-prefetch-max-extra-mb",
+        type=float,
+        default=512.0,
+        help="Abort GPU-resident prefetch if additional allocated CUDA memory exceeds this limit.",
+    )
+    parser.add_argument(
+        "--precision",
+        choices=["fp32", "fp16", "bf16"],
+        default="fp32",
+        help="CUDA autocast precision for inference-only replay.",
+    )
+    parser.add_argument(
+        "--convert-model-fp16",
+        action="store_true",
+        help="Convert model weights/buffers to fp16 after loading; intended only for CUDA serving probes.",
+    )
+    parser.add_argument(
+        "--timing-mode",
+        choices=["detailed", "end_to_end"],
+        default="detailed",
+        help=(
+            "detailed keeps per-stage CUDA synchronization for profiling; "
+            "end_to_end avoids profiling synchronizations and measures deployment-style latency."
+        ),
+    )
+    parser.add_argument(
+        "--skip-routing-budget",
+        action="store_true",
+        help="Skip per-window router-budget diagnostics during replay to measure the lean serving path.",
+    )
+    parser.add_argument(
+        "--dense-moe-serving",
+        action="store_true",
+        help=(
+            "Compute all low-rank MoE expert deltas and weight them by sparse router probabilities. "
+            "This is mathematically equivalent for zero-weighted experts, but avoids dynamic mask slicing."
+        ),
+    )
+    parser.add_argument(
+        "--cuda-graph-serving",
+        action="store_true",
+        help=(
+            "Experimental CUDA Graph replay path for fixed-shape serving. "
+            "Use with fixed router budget and --dense-moe-serving."
+        ),
+    )
+    parser.add_argument(
+        "--graph-safe-gpt2",
+        action="store_true",
+        help="Bypass HuggingFace GPT2Model.forward dynamic mask generation with a static block loop.",
+    )
+    parser.add_argument(
+        "--disable-gc-during-replay",
+        action="store_true",
+        help="Disable Python garbage collection during the timed replay loop to reduce tail jitter.",
+    )
+    parser.add_argument(
+        "--matmul-precision",
+        choices=["default", "highest", "high", "medium"],
+        default="default",
+        help="Optional torch float32 matmul precision setting for CUDA inference.",
+    )
+    parser.add_argument(
+        "--compile-model",
+        action="store_true",
+        help="Apply torch.compile to the loaded model for experimental inference acceleration.",
+    )
+    parser.add_argument(
+        "--compile-mode",
+        choices=["default", "reduce-overhead", "max-autotune"],
+        default="reduce-overhead",
+        help="torch.compile mode used when --compile-model is enabled.",
+    )
+    parser.add_argument(
+        "--keep-warm-gpu",
+        action="store_true",
+        help="Run a tiny CUDA matmul shortly before each paced release to reduce idle wake-up jitter.",
+    )
+    parser.add_argument(
+        "--keep-warm-lead-ms",
+        type=float,
+        default=12.0,
+        help="How long before a paced release to run the keep-warm CUDA operation.",
+    )
+    parser.add_argument(
+        "--keep-warm-period-ms",
+        type=float,
+        default=0.0,
+        help="If positive, repeat keep-warm CUDA operations during long paced idle gaps.",
+    )
+    parser.add_argument(
+        "--keep-warm-size",
+        type=int,
+        default=128,
+        help="Square matrix size used by the keep-warm CUDA operation.",
+    )
+    parser.add_argument(
+        "--busy-wait-final-ms",
+        type=float,
+        default=0.0,
+        help="Spin instead of sleeping during the final N milliseconds before a paced release.",
+    )
+    parser.add_argument(
+        "--process-priority",
+        choices=["unchanged", "above_normal", "high"],
+        default="unchanged",
+        help="Optional process priority class for Windows serving experiments.",
+    )
+    parser.add_argument(
+        "--win-timer-resolution-ms",
+        type=int,
+        default=0,
+        help="On Windows, request a temporary timer resolution via timeBeginPeriod.",
+    )
+    parser.add_argument(
+        "--router-topk-override",
+        type=int,
+        default=0,
+        help="Inference-only override for fixed MoE router top-k; 0 keeps checkpoint configuration.",
+    )
+    parser.add_argument(
+        "--dynamic-router-budget",
+        choices=["none", "confidence"],
+        default="none",
+        help="Inference-only dynamic sparse-budget controller.",
+    )
+    parser.add_argument("--dynamic-min-topk", type=int, default=1)
+    parser.add_argument("--dynamic-max-topk", type=int, default=2)
+    parser.add_argument(
+        "--dynamic-confidence-threshold",
+        type=float,
+        default=0.85,
+        help="Use min top-k when router top-1 confidence exceeds this value; otherwise use max top-k.",
+    )
     parser.add_argument("--output-dir", type=str, default="results/experiments/eadro_sn/realtime_moe")
     parser.add_argument("--print-every", type=int, default=10)
     return parser.parse_args()
@@ -179,6 +334,237 @@ def load_runtime_bundle_service_aware_eadro(
 
 def replay_case_id(source_id: str) -> str:
     return str(source_id).rsplit("_w", 1)[0]
+
+
+def configure_router_budget_policy(model: torch.nn.Module, args: argparse.Namespace) -> Dict[str, Any]:
+    layers = [module for module in model.modules() if isinstance(module, ServiceAwareMoELoRALayer)]
+    original_topk = sorted({int(layer.router_topk) for layer in layers})
+    if args.router_topk_override > 0:
+        override = int(args.router_topk_override)
+        for layer in layers:
+            layer.router_topk = max(1, min(override, layer.num_experts))
+
+    mode = "fixed" if args.dynamic_router_budget == "none" else args.dynamic_router_budget
+    for layer in layers:
+        layer.dense_expert_serving = bool(args.dense_moe_serving)
+        layer.set_router_budget_policy(
+            mode=mode,
+            min_topk=args.dynamic_min_topk,
+            max_topk=args.dynamic_max_topk,
+            confidence_threshold=args.dynamic_confidence_threshold,
+        )
+
+    return {
+        "router_budget_mode": mode,
+        "router_layer_count": len(layers),
+        "original_router_topk": original_topk,
+        "router_topk_override": None if args.router_topk_override <= 0 else int(args.router_topk_override),
+        "dynamic_min_topk": int(args.dynamic_min_topk),
+        "dynamic_max_topk": int(args.dynamic_max_topk),
+        "dynamic_confidence_threshold": float(args.dynamic_confidence_threshold),
+        "dense_moe_serving": bool(args.dense_moe_serving),
+    }
+
+
+def configure_process_runtime(args: argparse.Namespace) -> Dict[str, Any]:
+    status: Dict[str, Any] = {
+        "process_priority": args.process_priority,
+        "process_priority_status": "unchanged",
+        "win_timer_resolution_ms": int(args.win_timer_resolution_ms),
+        "win_timer_resolution_status": "unchanged",
+    }
+    if args.process_priority != "unchanged":
+        try:
+            import psutil
+
+            process = psutil.Process(os.getpid())
+            priority_map = {
+                "above_normal": psutil.ABOVE_NORMAL_PRIORITY_CLASS,
+                "high": psutil.HIGH_PRIORITY_CLASS,
+            }
+            process.nice(priority_map[args.process_priority])
+            status["process_priority_status"] = str(process.nice())
+        except Exception as exc:  # pragma: no cover - OS-dependent guard
+            status["process_priority_status"] = f"failed:{type(exc).__name__}: {exc}"
+
+    if os.name == "nt" and args.win_timer_resolution_ms > 0:
+        resolution = max(1, int(args.win_timer_resolution_ms))
+        try:
+            result = ctypes.windll.winmm.timeBeginPeriod(resolution)
+            status["win_timer_resolution_status"] = f"timeBeginPeriod={result}"
+            if result == 0:
+                atexit.register(ctypes.windll.winmm.timeEndPeriod, resolution)
+        except Exception as exc:  # pragma: no cover - OS-dependent guard
+            status["win_timer_resolution_status"] = f"failed:{type(exc).__name__}: {exc}"
+    return status
+
+
+def make_keep_warm_tensors(device: torch.device, size: int) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if device.type != "cuda" or size <= 0:
+        return None
+    warm = torch.randn((size, size), device=device)
+    out = torch.empty_like(warm)
+    return warm, out
+
+
+def run_keep_warm_op(
+    device: torch.device,
+    keep_warm_tensors: tuple[torch.Tensor, torch.Tensor],
+) -> None:
+    warm, out = keep_warm_tensors
+    with torch.inference_mode():
+        torch.mm(warm, warm, out=out)
+        torch.cuda.synchronize(device)
+
+
+def sleep_until_release(
+    scheduled_release: float,
+    args: argparse.Namespace,
+    device: torch.device,
+    keep_warm_tensors: tuple[torch.Tensor, torch.Tensor] | None,
+) -> int:
+    sleep_time = scheduled_release - time.perf_counter()
+    if sleep_time <= 0:
+        return 0
+
+    if not args.keep_warm_gpu or keep_warm_tensors is None or device.type != "cuda":
+        time.sleep(sleep_time)
+        return 0
+
+    lead_s = max(0.0, float(args.keep_warm_lead_ms)) / 1000.0
+    period_s = max(0.0, float(args.keep_warm_period_ms)) / 1000.0
+    keep_warm_count = 0
+
+    if period_s > 0:
+        while True:
+            remaining = scheduled_release - time.perf_counter()
+            if remaining <= lead_s:
+                break
+            time.sleep(min(period_s, max(0.0, remaining - lead_s)))
+            if scheduled_release - time.perf_counter() > lead_s:
+                run_keep_warm_op(device, keep_warm_tensors)
+                keep_warm_count += 1
+    else:
+        if sleep_time > lead_s:
+            time.sleep(max(0.0, sleep_time - lead_s))
+
+    run_keep_warm_op(device, keep_warm_tensors)
+    keep_warm_count += 1
+
+    remaining = scheduled_release - time.perf_counter()
+    busy_wait_s = max(0.0, float(args.busy_wait_final_ms)) / 1000.0
+    if remaining > busy_wait_s:
+        time.sleep(remaining - busy_wait_s)
+    while time.perf_counter() < scheduled_release:
+        pass
+    return keep_warm_count
+
+
+class CudaGraphServiceAwareReplay:
+    def __init__(
+        self,
+        bundle: RuntimeBundle,
+        ckpt_args: Dict[str, Any],
+        template_batch: SampleBatch,
+        amp_dtype: torch.dtype | None,
+        *,
+        preloaded_modalities_ready: bool = False,
+    ) -> None:
+        if bundle.device.type != "cuda":
+            raise ValueError("CUDA Graph serving requires a CUDA device")
+        self.bundle = bundle
+        self.ckpt_args = ckpt_args
+        self.amp_dtype = amp_dtype
+        self.preloaded_modalities_ready = preloaded_modalities_ready
+        self.static_batch = maybe_disable_modalities(
+            template_batch.to(bundle.device, non_blocking=template_batch.is_pinned()),
+            ckpt_args,
+        )
+        self.graph = torch.cuda.CUDAGraph()
+        self.static_output: torch.Tensor | None = None
+
+        torch.cuda.synchronize(bundle.device)
+        with torch.inference_mode():
+            for _ in range(3):
+                self._forward_static()
+        torch.cuda.synchronize(bundle.device)
+
+        with torch.cuda.graph(self.graph):
+            self.static_output = self._forward_static()
+        torch.cuda.synchronize(bundle.device)
+
+    def _forward_static(self) -> torch.Tensor:
+        if self.amp_dtype is not None:
+            with torch.autocast(device_type="cuda", dtype=self.amp_dtype):
+                cls_probs, _ = self.bundle.model(
+                    self.static_batch.data_node,
+                    self.static_batch.data_log,
+                    self.static_batch.data_edge,
+                    self.static_batch.groundtruth_cls,
+                    evaluate=True,
+                )
+        else:
+            cls_probs, _ = self.bundle.model(
+                self.static_batch.data_node,
+                self.static_batch.data_log,
+                self.static_batch.data_edge,
+                self.static_batch.groundtruth_cls,
+                evaluate=True,
+            )
+        return cls_probs
+
+    def replay(self, batch_cpu: SampleBatch) -> torch.Tensor:
+        batch_device = batch_cpu.to(self.bundle.device, non_blocking=batch_cpu.is_pinned())
+        if not self.preloaded_modalities_ready:
+            batch_device = maybe_disable_modalities(batch_device, self.ckpt_args)
+        self.static_batch.data_node.copy_(batch_device.data_node, non_blocking=True)
+        self.static_batch.data_log.copy_(batch_device.data_log, non_blocking=True)
+        self.static_batch.data_edge.copy_(batch_device.data_edge, non_blocking=True)
+        self.static_batch.groundtruth_cls.copy_(batch_device.groundtruth_cls, non_blocking=True)
+        if self.static_batch.groundtruth_real is not None and batch_device.groundtruth_real is not None:
+            self.static_batch.groundtruth_real.copy_(batch_device.groundtruth_real, non_blocking=True)
+        self.graph.replay()
+        if self.static_output is None:
+            raise RuntimeError("CUDA graph output was not initialized")
+        return self.static_output.detach().cpu()
+
+
+def timed_cuda_graph_window_inference(
+    graph_runner: CudaGraphServiceAwareReplay,
+    batch_cpu: SampleBatch,
+    sample_idx: int,
+    threshold: float,
+    window_score_method: str,
+) -> Dict[str, Any]:
+    t0 = time.perf_counter()
+    cls_probs = graph_runner.replay(batch_cpu)
+    t1 = time.perf_counter()
+    prediction = summarize_prediction(
+        cls_probs,
+        graph_runner.bundle.service_names,
+        threshold,
+        top_k=3,
+        window_score_method=window_score_method,
+    )
+    true_root_services = extract_true_root_services(batch_cpu, graph_runner.bundle.service_names)
+    true_abnormal_services = extract_true_abnormal_services(batch_cpu, graph_runner.bundle.service_names)
+    t2 = time.perf_counter()
+    return {
+        "sample_idx": int(sample_idx),
+        "source_id": batch_cpu.source_id,
+        "sample_load_ms": 0.0,
+        "tensorize_ms": 0.0,
+        "transfer_ms": 0.0,
+        "inference_ms": (t1 - t0) * 1000.0,
+        "postprocess_ms": (t2 - t1) * 1000.0,
+        "total_ms": (t2 - t0) * 1000.0,
+        "true_root_services": true_root_services,
+        "true_abnormal_services": true_abnormal_services,
+        "window_anomaly_label": bool(true_abnormal_services),
+        "routing_budget": {},
+        "timing_mode": "cuda_graph",
+        **prediction,
+    }
 
 
 def apply_temporal_postprocess(
@@ -293,7 +679,11 @@ def apply_temporal_postprocess(
 
 def main() -> int:
     args = parse_args()
+    process_runtime = configure_process_runtime(args)
     device = resolve_device(args.device)
+    configure_matmul_precision(args.matmul_precision, device)
+    amp_dtype = resolve_amp_dtype(args.precision, device)
+    set_replay_amp_dtype(amp_dtype)
 
     checkpoint_path = resolve_path(args.checkpoint)
     if not checkpoint_path.exists():
@@ -305,6 +695,24 @@ def main() -> int:
         data_dir_override=args.data_dir,
         device=device,
     )
+    if args.graph_safe_gpt2:
+        enable_graph_safe_gpt2_forward(bundle.model)
+    if args.convert_model_fp16:
+        if bundle.device.type != "cuda":
+            raise ValueError("--convert-model-fp16 requires CUDA")
+        bundle.model.half()
+    compile_status = "disabled"
+    if args.compile_model:
+        compile_mode = None if args.compile_mode == "default" else args.compile_mode
+        try:
+            dynamo = importlib.import_module("torch._dynamo")
+            dynamo.config.suppress_errors = True
+            bundle.model = torch.compile(bundle.model, mode=compile_mode, fullgraph=False, dynamic=False)
+            compile_status = f"enabled:{args.compile_mode}"
+        except Exception as exc:  # pragma: no cover - defensive runtime guard
+            compile_status = f"failed:{type(exc).__name__}: {exc}"
+            print(f"torch.compile failed; continuing without compilation: {exc}")
+    router_policy = configure_router_budget_policy(bundle.model, args)
     summary_path, diagnostic_path = infer_artifact_paths(
         checkpoint_path,
         ckpt_args,
@@ -326,21 +734,52 @@ def main() -> int:
 
     output_dir = ensure_dir(resolve_path(args.output_dir))
     run_name = checkpoint_path.parent.name
-    run_id = f"{run_name}_{args.split}_{timestamp_tag()}"
+    run_id = (
+        f"{run_name}_{args.split}_{args.precision}_"
+        f"{args.dynamic_router_budget}_k{args.dynamic_min_topk}-{args.dynamic_max_topk}_"
+        f"{timestamp_tag()}"
+    )
 
     print(f"Loaded {len(bundle.dataset)} samples from Eadro-SN/{args.split}")
     print(f"Checkpoint   : {bundle.checkpoint_path}")
     print(f"Device       : {bundle.device}")
+    print(f"Precision    : {args.precision}")
+    print(f"Model fp16   : {args.convert_model_fp16}")
+    print(f"Graph GPT-2  : {args.graph_safe_gpt2}")
+    print(f"MatMul       : {args.matmul_precision}")
+    print(f"Compile      : {compile_status}")
     print(f"Threshold    : {threshold:.4f} ({threshold_source})")
     print(f"Window Score : {args.window_score_method}")
     print(f"Temporal     : {args.temporal_postprocess}")
     print(
+        "Router Budget: "
+        f"{router_policy['router_budget_mode']} "
+        f"(override={router_policy['router_topk_override']}, "
+        f"min={router_policy['dynamic_min_topk']}, max={router_policy['dynamic_max_topk']}, "
+        f"conf={router_policy['dynamic_confidence_threshold']:.3f}, "
+        f"dense_moe={router_policy['dense_moe_serving']})"
+    )
+    print(
         f"Interval     : {interval_ms:.2f} ms, Deadline: {deadline_ms:.2f} ms, "
         f"Pace={args.pace}, Prefetch={args.prefetch}, PinMemory={args.pin_memory}"
+    )
+    print(f"Timing Mode  : {args.timing_mode}, RoutingBudget={not args.skip_routing_budget}")
+    print(
+        "Runtime      : "
+        f"priority={process_runtime['process_priority_status']}, "
+        f"timer={process_runtime['win_timer_resolution_status']}"
+    )
+    print(
+        f"Prefetch Dev : {args.prefetch_device}, "
+        f"KeepWarm={args.keep_warm_gpu} lead={args.keep_warm_lead_ms:.1f}ms "
+        f"period={args.keep_warm_period_ms:.1f}ms, "
+        f"busy_wait={args.busy_wait_final_ms:.1f}ms"
     )
 
     prefetched_batches = None
     prefetch_wall_ms = 0.0
+    gpu_prefetch_stats: Dict[str, Any] = {"enabled": False}
+    preloaded_modalities_ready = False
     if args.prefetch:
         print(f"Prefetching {max_steps} samples into CPU memory...")
         prefetch_start = time.perf_counter()
@@ -352,6 +791,29 @@ def main() -> int:
         )
         prefetch_wall_ms = (time.perf_counter() - prefetch_start) * 1000.0
         print(f"Prefetch complete: {len(prefetched_batches)} samples loaded in {prefetch_wall_ms:.2f} ms")
+        if args.prefetch_device == "cuda":
+            if bundle.device.type != "cuda":
+                raise ValueError("--prefetch-device cuda requires --device cuda/auto with CUDA available")
+            print("Moving prefetched samples to CUDA memory...")
+            gpu_prefetch_start = time.perf_counter()
+            prefetched_batches, gpu_prefetch_stats = move_prefetched_batches_to_device(
+                prefetched_batches,
+                bundle.device,
+                ckpt_args,
+                max_extra_mb=float(args.gpu_prefetch_max_extra_mb),
+            )
+            gpu_prefetch_stats = {
+                **gpu_prefetch_stats,
+                "enabled": True,
+                "wall_ms": (time.perf_counter() - gpu_prefetch_start) * 1000.0,
+            }
+            preloaded_modalities_ready = True
+            print(
+                "CUDA prefetch complete: "
+                f"{gpu_prefetch_stats['count']} samples, "
+                f"extra={gpu_prefetch_stats['extra_allocated_mb']:.2f} MB, "
+                f"wall={gpu_prefetch_stats['wall_ms']:.2f} ms"
+            )
 
     warmup_runtime(
         bundle,
@@ -361,7 +823,30 @@ def main() -> int:
         threshold=threshold,
         prefetched_batches=prefetched_batches,
         window_score_method=args.window_score_method,
+        timing_mode=args.timing_mode,
+        collect_routing_budget=not args.skip_routing_budget,
+        preloaded_modalities_ready=preloaded_modalities_ready,
     )
+
+    graph_runner: CudaGraphServiceAwareReplay | None = None
+    if args.cuda_graph_serving:
+        if not args.prefetch or prefetched_batches is None:
+            raise ValueError("--cuda-graph-serving requires --prefetch")
+        if not args.dense_moe_serving:
+            raise ValueError("--cuda-graph-serving requires --dense-moe-serving for a stable graph path")
+        template_idx = args.start_index
+        template_batch = prefetched_batches.get(template_idx)
+        if template_batch is None:
+            raise ValueError(f"No prefetched template batch found for sample {template_idx}")
+        print("Capturing CUDA Graph serving path...")
+        graph_runner = CudaGraphServiceAwareReplay(
+            bundle,
+            ckpt_args,
+            template_batch,
+            amp_dtype,
+            preloaded_modalities_ready=preloaded_modalities_ready,
+        )
+        print("CUDA Graph capture complete.")
 
     if bundle.device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(bundle.device)
@@ -370,23 +855,46 @@ def main() -> int:
     temporal_state: Dict[str, Any] = {}
     interval_s = interval_ms / 1000.0
     base_release = time.perf_counter()
+    keep_warm_tensors = make_keep_warm_tensors(bundle.device, args.keep_warm_size)
+    keep_warm_count = 0
+    gc_was_enabled = gc.isenabled()
+    if args.disable_gc_during_replay:
+        gc.disable()
     for step in range(max_steps):
         sample_idx = args.start_index + step
         scheduled_release = base_release + step * interval_s if args.pace else time.perf_counter()
         if args.pace:
-            sleep_time = scheduled_release - time.perf_counter()
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+            keep_warm_count += sleep_until_release(
+                scheduled_release,
+                args,
+                bundle.device,
+                keep_warm_tensors,
+            )
 
         actual_start = time.perf_counter()
-        record = timed_eadro_window_inference(
-            bundle,
-            ckpt_args=ckpt_args,
-            sample_idx=sample_idx,
-            threshold=threshold,
-            preloaded_batch=None if prefetched_batches is None else prefetched_batches.get(sample_idx),
-            window_score_method=args.window_score_method,
-        )
+        if graph_runner is None:
+            record = timed_eadro_window_inference(
+                bundle,
+                ckpt_args=ckpt_args,
+                sample_idx=sample_idx,
+                threshold=threshold,
+                preloaded_batch=None if prefetched_batches is None else prefetched_batches.get(sample_idx),
+                window_score_method=args.window_score_method,
+                timing_mode=args.timing_mode,
+                collect_routing_budget=not args.skip_routing_budget,
+                preloaded_modalities_ready=preloaded_modalities_ready,
+            )
+        else:
+            preloaded = prefetched_batches.get(sample_idx) if prefetched_batches is not None else None
+            if preloaded is None:
+                raise RuntimeError(f"CUDA graph replay requires prefetched batch for sample {sample_idx}")
+            record = timed_cuda_graph_window_inference(
+                graph_runner,
+                preloaded,
+                sample_idx,
+                threshold,
+                args.window_score_method,
+            )
         apply_temporal_postprocess(record, temporal_state, args, threshold)
         finish_time = time.perf_counter()
         response_time_ms = (finish_time - scheduled_release) * 1000.0
@@ -414,6 +922,8 @@ def main() -> int:
             or step == max_steps - 1
         ):
             print_step(event)
+    if args.disable_gc_during_replay and gc_was_enabled:
+        gc.enable()
 
     deadline_misses = sum(1 for event in events if not event["deadline_met"])
     processing_stats = summarize_latency_records(events)
@@ -436,6 +946,27 @@ def main() -> int:
     replay_preds = [int(event["window_anomaly_prediction"]) for event in events]
     replay_labels = [int(event["window_anomaly_label"]) for event in events]
     replay_detection_metrics = compute_binary_metrics(replay_preds, replay_labels)
+    routing_selected_k = []
+    routing_active_experts = []
+    for event in events:
+        budget = event.get("routing_budget") or {}
+        selected_hist = ((budget.get("selected_k") or {}).get("histogram") or {})
+        active_hist = ((budget.get("active_experts") or {}).get("histogram") or {})
+        for key, count in selected_hist.items():
+            routing_selected_k.extend([int(key)] * int(count))
+        for key, count in active_hist.items():
+            routing_active_experts.extend([int(key)] * int(count))
+
+    def summarize_router_values(values: list[int]) -> Dict[str, Any]:
+        histogram: dict[str, int] = {}
+        for value in values:
+            key = str(int(value))
+            histogram[key] = histogram.get(key, 0) + 1
+        return {
+            "count": len(values),
+            "mean": float(np.mean(values)) if values else 0.0,
+            "histogram": histogram,
+        }
 
     offline_reference = None
     if diagnostic_payload is not None:
@@ -466,6 +997,26 @@ def main() -> int:
         "mode": "paced_replay" if args.pace else "as_fast_as_possible",
         "prefetch_enabled": args.prefetch,
         "pin_memory_enabled": args.pin_memory,
+        "prefetch_device": args.prefetch_device,
+        "gpu_prefetch": gpu_prefetch_stats,
+        "precision": args.precision,
+        "convert_model_fp16": args.convert_model_fp16,
+        "matmul_precision": args.matmul_precision,
+        "compile_model": args.compile_model,
+        "compile_mode": args.compile_mode,
+        "compile_status": compile_status,
+        "cuda_graph_serving": args.cuda_graph_serving,
+        "graph_safe_gpt2": args.graph_safe_gpt2,
+        "process_runtime": process_runtime,
+        "timing_mode": args.timing_mode,
+        "routing_budget_collected": not args.skip_routing_budget,
+        "gc_disabled_during_replay": args.disable_gc_during_replay,
+        "keep_warm_gpu": args.keep_warm_gpu,
+        "keep_warm_lead_ms": args.keep_warm_lead_ms,
+        "keep_warm_period_ms": args.keep_warm_period_ms,
+        "keep_warm_size": args.keep_warm_size,
+        "busy_wait_final_ms": args.busy_wait_final_ms,
+        "keep_warm_count": keep_warm_count,
         "prefetch_wall_ms": prefetch_wall_ms,
         "num_steps": max_steps,
         "start_index": args.start_index,
@@ -473,6 +1024,9 @@ def main() -> int:
         "deadline_ms": deadline_ms,
         "deadline_miss_count": deadline_misses,
         "deadline_miss_rate_pct": deadline_misses / max_steps * 100.0,
+        "router_budget_policy": router_policy,
+        "router_selected_k_summary": summarize_router_values(routing_selected_k),
+        "router_active_experts_summary": summarize_router_values(routing_active_experts),
         "processing_latency": processing_stats,
         "response_latency": response_stats,
         "replay_detection_target": "window_anomaly",
@@ -505,6 +1059,12 @@ def main() -> int:
     print(f"Prefetch     : {summary['prefetch_enabled']} (pin_memory={summary['pin_memory_enabled']})")
     print(f"Steps        : {summary['num_steps']}")
     print(f"Miss Rate    : {summary['deadline_miss_rate_pct']:.2f}%")
+    print(
+        "Router k     : "
+        f"selected_mean={summary['router_selected_k_summary']['mean']:.3f}  "
+        f"active_mean={summary['router_active_experts_summary']['mean']:.3f}  "
+        f"hist={summary['router_selected_k_summary']['histogram']}"
+    )
     print(
         "Replay Det   : "
         f"F1={summary['replay_detection_metrics']['f1']:.4f}  "

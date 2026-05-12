@@ -2,30 +2,30 @@
 
 \subsection{Multimodal Observation Model}
 
-We consider a real-time multimodal diagnosis system deployed in cloud microservice environments. At each discrete time step \(t\), the system collects a heterogeneous set of observations within a sliding window
+We consider \lb{an empirical deadline-aware} multimodal diagnosis system deployed in cloud microservice environments. At each inference step \(t\), the system consumes a sliding-window snapshot of preprocessed multimodal observations:
 
 \begin{equation}
-\mathcal{O}(t) = \{\mathcal{O}^{m}(t), \mathcal{O}^{l}(t), \mathcal{O}^{tr}(t)\},
+\mathcal{O}_{t-W+1:t} =
+\{\mathbf{X}^{m}_{t-W+1:t}, \mathbf{X}^{l}_{t-W+1:t}, \mathbf{X}^{tr}_{t-W+1:t}\},
 \end{equation}
-where $\mathcal{O}^{m}(t)$, $\mathcal{O}^{l}(t)$, and $\mathcal{O}^{tr}(t)$ denote metrics, logs, and traces, respectively.
-Together, they capture complementary facets of system behavior: metrics reflect resource usage patterns (e.g., CPU, memory, and network I/O), logs record semantic events and error messages, and traces encode request flows along with their service dependencies. The joint observation \(\mathcal{O}(t)\) thus serves as the input to the online diagnosis process.
+where \(\mathbf{X}^{m}\in\mathbb{R}^{W\times N\times d_m}\) denotes service-level metric features, \(\mathbf{X}^{l}\in\mathbb{R}^{W\times N\times d_l}\) denotes log-derived statistical features, and \(\mathbf{X}^{tr}\in\mathbb{R}^{W\times N\times N\times d_{tr}}\) denotes trace edge features over service pairs. Together, they capture complementary facets of system behavior: metrics reflect resource usage patterns such as CPU, memory, and network traffic, logs summarize the distribution of runtime events such as error and warning levels, and traces encode request-flow relations together with edge statistics such as call counts and durations. The joint window \(\mathcal{O}_{t-W+1:t}\) thus serves as the input to the online diagnosis process.
 
 \subsection{Diagnosis Objective}
 
-Given the observation $\mathcal{O}(t)$, the diagnosis system aims to accomplish three interrelated tasks: anomaly detection, root cause analysis, and diagnosis explanation. Specifically, the system first determines whether the current state is abnormal, then identifies the root service responsible for the anomaly, and finally provides interpretable signals to support the diagnosis decision.
+Given the observation window \(\mathcal{O}_{t-W+1:t}\), the diagnosis system aims to produce an online anomaly decision together with service-level ranking and attribution signals. Specifically, the system determines whether the current window is abnormal, assigns anomaly scores to services, and exposes diagnostic evidence that can support subsequent root-cause analysis by operators or downstream tools.
 
-These tasks must be performed in an online manner under strict real-time constraints. Each inference process, from feature extraction to final decision making, is required to complete within a predefined latency budget $D$, which is determined by the response requirements of the target cloud application.
+These tasks must be performed in an online manner under a predefined latency budget $D$, which is determined by the response requirements of the target cloud application. \lb{We treat this as an empirical soft real-time requirement evaluated through online replay: deadline misses and observed tail latency are measured directly, while formal WCET and schedulability bounds are outside the scope of the current prototype.}
 \subsection{Inference and Latency Model}
 
-We model the diagnosis process as a parametric inference function \(f\) that maps the observation \(\mathcal{O}(t)\) to a predicted diagnosis result \(\hat{y}(t)\):
+We model the diagnosis process as a parametric inference function \(f\) that maps the observation window \(\mathcal{O}_{t-W+1:t}\) to a predicted diagnosis result \(\hat{y}(t)\):
 \[
-\hat{y}(t) = f(\mathcal{O}(t); k(t)),
+\hat{y}(t) = f(\mathcal{O}_{t-W+1:t}; k(t)),
 \]
-where \(k(t)\) is a control parameter denoting the number of activated experts in a mixture-of-experts (MoE) style architecture. The inference latency is assumed to be linear in \(k(t)\), taking the form
+where \lb{\(k(t)\) denotes the runtime sparse expert budget, i.e., the number of experts activated by the router at each adapted layer under a bounded maximum budget selected by a validation-fixed confidence-threshold policy}. In practice, latency is affected by fixed preprocessing, device transfer, kernel scheduling, and sparse expert execution. We therefore use the following abstract decomposition:
 \[
-T(t) = T_0 + \beta k(t),
+T(t) = T_{\mathrm{base}}(t) + T_{\mathrm{sparse}}(t;k(t)),
 \]
-where \(T_0\) represents the fixed base latency (e.g., input processing and output aggregation) and \(\beta\) is the per-expert computational overhead. To satisfy the real-time requirement, the system must enforce
+where \(T_{\mathrm{base}}(t)\) includes data preparation and backbone execution, and \lb{\(T_{\mathrm{sparse}}(t;k(t))\) is the additional cost of sparse expert adaptation under the selected runtime budget}. The system aims to keep the observed response time within the deadline budget
 \[
 T(t) \leq D,
 \]
@@ -34,21 +34,17 @@ for every inference step \(t\).
 
 \subsection{Adaptive Inference Control}
 
-The variable $k(t)$ determines the computational cost of inference.
-The value of $k(t)$ is adaptively determined according to runtime conditions, enabling flexible control of inference cost under latency constraints.
-\textit{The variable $k(t)$ serves as a controllable inference knob that directly governs the trade-off between inference latency and diagnostic performance.}
-
-Larger $k(t)$ improves diagnostic accuracy by activating more experts, while smaller $k(t)$ reduces latency.
+\lb{The sparse budget \(k(t)\) determines how many experts are evaluated for the current routed representation, subject to a maximum budget \(k_{\max}\). ASID learns router scores and service-conditioned prior weights during training, while the hard budget threshold is selected on the validation split and then fixed before test replay. At inference time, the confidence-threshold policy maps the router top-1 confidence to \(k(t)\), and the router selects the expert indices under that budget. Larger budgets may increase representational capacity but also raise computational cost; smaller budgets reduce cost but may weaken expert specialization.}
 
 \subsection{Problem Formulation}
 
-Our objective is to design an adaptive inference policy that selects $k(t)$ to maximize diagnostic performance under latency constraints:
+Our objective is to design a sparse inference policy that maximizes diagnostic performance under latency constraints.
 
 \begin{align}
-\max_{k(t)} \quad & \mathbb{E}[A(t)] \\
+\lb{\max_{\theta,\,\rho} \quad} & \lb{\mathbb{E}[A(t)]} \\
 \text{s.t.} \quad
-& T(t) \leq D, \\
-& k(t) \in \{1,2,\dots,K\}.
+& \lb{T(t) \leq D,} \\
+& \lb{|\rho(\mathcal{O}_{t-W+1:t})| = k(t) \leq k_{\max}.}
 \end{align}
 
-This formulation captures the fundamental trade-off between accuracy and real-time efficiency in online diagnosis systems.
+\lb{Here \(A(t)\) denotes the diagnosis utility, \(\theta\) denotes trainable model parameters, and \(\rho(\cdot)\) denotes the sparse routing policy. The runtime budget \(k(t)\) is produced by the confidence-adaptive budget rule, and the router then selects the active expert set under that budget.}

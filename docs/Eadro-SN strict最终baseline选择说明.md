@@ -1,6 +1,6 @@
 # Eadro-SN strict 最终 baseline 选择说明
 
-更新时间：`2026-04-28`
+更新时间：`2026-05-11`
 
 ## 1. 选择原则
 
@@ -10,41 +10,46 @@
 |---|---|---|
 | 官方 train-normal-only baseline | 协议干净，不依赖监督异常标签 | `GDN-official logs-only` |
 | 外部 fast-but-weak baseline | 外部方法可以实时，但检测能力不足 | `GDN-official`, `TranAD`, `TraceAnomaly`, `Anomaly Transformer` |
-| 外部 high-accuracy / slow baseline | 外部方法可以提高 F1，但无法满足 `100ms` deadline | `XGBoost ensemble-64` |
-| 外部 balanced baseline | F1 中等，实时性部分失败但没有完全崩溃 | `RBF-SVM ensemble-24` |
-| 更慢的 high-recall 补充对照 | 强化“高成本外部 ensemble 不适合 RTSS” | `XGBoost + RBF-SVM score ensemble`, `RBF-SVM ensemble-64` |
+| 同类多模态 deep baseline | 回答“是否只和单模态 TSAD 比较”的公平性问题 | `Eadro official artifact, h128`, `MTAD-GAT-style full modality` |
+| 外部 strong supervised tree baseline | 外部监督树模型可以做到较强 F1 和 realtime，需要证明 ASID 仍然更准更快 | `XGBoost ensemble-64` |
+| 外部 balanced / kernel baseline | F1 中等，展示 kernel ensemble 的 accuracy-latency 折中 | `RBF-SVM ensemble-24` |
+| 高成本 kernel 补充对照 | 强化“顺序 kernel ensemble 不适合 RTSS” | `RBF-SVM ensemble-64`, `XGBoost + RBF-SVM score ensemble` |
 
-`XGBoost standalone` 和 `XGBoost ensemble-16` 不进入主表。它们是 supervised probe，虽然精度强，但推理仍较快；放进主表会削弱 RTSS 的 high-accuracy-slow baseline 叙事。它们可以留在附录或内部记录中说明“我们也探索过轻量监督分类器”。
+`XGBoost standalone` 和 `XGBoost ensemble-16` 不进入主表。它们是 supervised probe，optimized serving 后分别达到 `p99=16.76ms` 和 `23.91ms`，说明树模型可以很快，但 F1 仍低于 ASID。它们可以留在附录或内部记录中说明“我们也探索过轻量监督分类器”。
 
 ## 2. 最终推荐 baseline 表
 
-表中的 `Ours` 对应论文方法 ASID 的完整在线配置：`Multimodal Encoding and Fusion` + `Deviation-Aware Temporal Modeling` + `Lightweight Frozen GPT-2 Backbone` + `Adaptive Sparse Inference / Context-Aware Sparse Adapter` + `Downstream Diagnosis Heads`。
+表中的 `Ours` 对应论文方法 ASID 的完整在线配置：`Multimodal Encoding and Fusion` + `Deviation-Aware Temporal Modeling` + `Lightweight Frozen GPT-2 Backbone` + `Adaptive Sparse Inference / Context-Aware Sparse Adapter` + `Downstream Diagnosis Heads`。其中 sparse budget 使用 validation-selected `dynamic k(t)`：`tau_k=0.60`, maximum `top-k=2`, test replay `avg k=1.890`。
 
 | 类别 | 方法 | Test F1 | Precision | Recall | miss@100ms | p99(ms) | 最终用途 |
 |---|---|---:|---:|---:|---:|---:|---|
-| Ours | `Service-aware MoE full modality + top3 guarded high` | **`0.9838`** | `0.9815` | `0.9860` | **`0.0%`** | `60.14` | 主结果 |
-| External high-accuracy / slow | `XGBoost ensemble-64` | `0.9262` | `0.8922` | `0.9628` | `13.2%` | `757.82` | 最关键外部强精度慢 baseline |
-| External balanced | `RBF-SVM ensemble-24` | `0.8554` | `0.7695` | `0.9628` | `14.0%` | `185.35` | 中等 F1，少量但明显不稳定的 deadline miss |
-| External high-accuracy / very slow | `XGBoost + RBF-SVM score ensemble` | `0.9075` | `0.8619` | `0.9581` | `96.0%` | `2242.23` | 补充慢 baseline |
-| External slow component | `RBF-SVM ensemble-64` | `0.8589` | `0.7753` | `0.9628` | `100.0%` | `1167.25` | 证明 kernel ensemble 成本高 |
-| Official train-normal-only | `GDN-official logs-only` | `0.7344` | `0.8343` | `0.6558` | `0.0%` | `19.93` | 最干净官方 TSAD baseline |
-| External train-normal-only | `TraceAnomaly` | `0.6930` | `0.6556` | `0.7349` | `0.0%` | `22.71` | 非 GDN 类 baseline |
-| External train-normal-only | `TranAD logs-only` | `0.6821` | `0.7600` | `0.6186` | `0.0%` | `22.00` | Transformer baseline |
-| External train-normal-only | `Anomaly Transformer traces+max` | `0.5537` | `0.3835` | `0.9953` | `0.0%` | `23.51` | 高召回低精度 baseline |
+| Ours | `Service-aware MoE full modality + dynamic k(t) + top3 guarded high` | **`0.9838`** | `0.9815` | `0.9860` | **`0.0%`** | `16.69` fp16 graph-safe serving / fixed-`k=2` CUDA Graph `2.38` | 主结果；dynamic `tau_k=0.60`, paired budget-verified `avg k=1.890`；`2.38ms` 是 fixed-budget serving fast path |
+| Multimodal supervised deep | `Eadro official artifact, h128` | `0.9336` | `0.9189` | `0.9488` | `0.0%` | `9.64` | 官方 artifact 适配 strict split 后的同源多模态 deep baseline |
+| Strong supervised tree | `XGBoost ensemble-64` | `0.9262` | `0.8922` | `0.9628` | `0.0%` | `40.15` | optimized resident serving；强但低于 ASID |
+| External balanced / kernel | `RBF-SVM ensemble-24` | `0.8554` | `0.7695` | `0.9628` | `0.0%` | `62.16` | 中等 F1，optimized full replay 满足 100ms |
+| External high-cost kernel | `RBF-SVM ensemble-64` | `0.8589` | `0.7753` | `0.9628` | `63.7%` | `219.73` | 高成本 kernel ensemble 不满足 deadline |
+| External high-cost score ensemble | `XGBoost + RBF-SVM score ensemble` | `0.9075` | `0.8619` | `0.9581` | `96.0%` | `2242.23` | 旧顺序 score ensemble，仅作补充慢对照 |
+| Official train-normal-only | `GDN-official logs-only` | `0.7344` | `0.8343` | `0.6558` | `0.0%` | `20.61` | 最干净官方 TSAD baseline，实时但弱 |
+| External train-normal-only | `TraceAnomaly` | `0.6930 offline` | `0.6556` | `0.7349` | `0.0%` | `22.62` | 论文主表采用 offline full-test 检测指标；TF1/Docker resident replay score path 退化为 `F1=0.5360`，仅作实现备注 |
+| External train-normal-only | `TranAD logs-only` | `0.6821` | `0.7600` | `0.6186` | `0.0%` | `20.46` | Transformer baseline |
+| External train-normal-only | `Anomaly Transformer traces+max` | `0.5537` | `0.3835` | `0.9953` | `0.0%` | `24.33` | 高召回低精度 baseline |
+| Multimodal deep train-normal-only | `MTAD-GAT-style full modality` | `0.5499` | `0.3792` | `1.0000` | `0.0%` | `20.30` | 同类多模态 deep baseline，但 strict 下不具竞争力 |
 
 说明：
 
-- `XGBoost ensemble-64` 的实时性使用完整 `568-step` replay：`miss@100ms=13.2%`, response `p99=757.82ms`, `max=812.61ms`。
-- `RBF-SVM ensemble-24` 使用统一外部 baseline `100-step` resident replay：`miss@100ms=14.0%`, response `p99=185.35ms`, `max=190.39ms`。它承担 balanced baseline，而不是 high-accuracy baseline。
-- 传统 TSAD baseline 的 replay 仍是统一 resident replay 口径；它们实时性好，但检测能力明显弱。
-- `XGBoost + RBF-SVM score ensemble` 与 `RBF-SVM ensemble-64` 使用 `100-step` replay 结果，已足够证明顺序 kernel ensemble 远超 deadline。
+- `XGBoost ensemble-64` 的最新公平 serving 口径使用完整 `568-step` replay：resident features / resident models / `Booster.inplace_predict`，`miss@100ms=0.0%`, response `p99=40.15ms`, `max=47.71ms`。因此不能再写成 slow baseline。
+- `RBF-SVM ensemble-24` 最新 full replay 也满足 `100ms` deadline：`miss@100ms=0.0%`, response `p99=62.16ms`, `max=68.72ms`；`RBF-SVM ensemble-64` 才是高成本 kernel 对照。
+- 传统 TSAD baseline 的 optimized replay 都能满足 realtime，但检测能力明显弱。
+- `MTAD-GAT-style full modality` 使用 `metrics+logs+traces` 三模态输入，离线 full-test `F1=0.5499`，568-step optimized replay 下 `miss@100ms=0.0%`, response `p99=20.30ms`, `max=21.60ms`。它补齐“同类多模态 deep baseline”，但不改变最终 baseline 排序。
+- `Eadro official artifact, h128` 来自公开 `BEbillionaireUSD/Eadro` artifact，使用独立 `eadro_env` 运行旧版 `torch/dgl` 依赖。我们只修复运行兼容问题（`ConvNet` dropout 参数、trace/metric dropout 默认值、`SelfAttention` batch 维度、detector/localizer 属性名），保留官方 modal encoders、GATv2 dependency module 和 joint detection/localization objective。该 baseline 使用相同 strict case-level train/val/test split、validation-selected threshold、test final evaluation，在 full `568-step` replay 下达到 `F1=0.9336, P=0.9189, R=0.9488, Acc=0.9489, miss@100ms=0.0%, p99=9.64ms, max=13.67ms`。
+- `XGBoost + RBF-SVM score ensemble` 是旧版顺序 ensemble 结果，仍可作为高成本补充对照；若主文采用 optimized serving 口径，主表不应把它作为最关键 baseline。
 
 ## 3. 不放主表的结果
 
 | 方法 | Test F1 | replay p99(ms) | 不放主表原因 |
 |---|---:|---:|---|
-| `XGBoost standalone` | `0.9007` | `16.40` | supervised fast probe；不适合作为 RTSS slow baseline |
-| `XGBoost ensemble-16` | `0.9300` | `28.65` | 精度强但仍较快；容易削弱 high-accuracy-slow 对照叙事 |
+| `XGBoost standalone` | `0.9007` | `16.76` | supervised fast probe；F1 明显低于 ASID |
+| `XGBoost ensemble-16` | `0.9300` | `23.91` | 精度强但仍低于 ASID；可作为附录 probe |
 
 这两条不建议放主表，但可以放附录或实验记录，避免被问到时显得没有做过。
 
@@ -52,19 +57,32 @@
 
 建议写法：
 
-> We include multiple external baseline regimes. Train-normal-only TSAD baselines such as GDN, TraceAnomaly, TranAD, and Anomaly Transformer are realtime-friendly but substantially weaker in detection. A medium-cost RBF-SVM ensemble provides a balanced point (`F1=0.8554`, `miss=14.0%`). To avoid comparing only against weak fast baselines, we additionally construct a supervised high-accuracy external ensemble. The strongest one, XGBoost ensemble-64, reaches `F1=0.9262` but fails the `100ms` deadline in full replay (`miss=13.2%`, `p99=757.82ms`). Our method achieves `F1=0.9838` while keeping `0 miss@100ms`, showing a better accuracy-latency tradeoff.
+> We include multiple external baseline regimes. Train-normal-only TSAD baselines such as GDN, TraceAnomaly, TranAD, Anomaly Transformer, and a full-modality MTAD-GAT-style baseline are realtime-friendly but substantially weaker in detection. We further include the official Eadro artifact adapted to the same strict split, which reaches `F1=0.9336` with `0 miss@100ms` on the full replay. Optimized supervised tree baselines are strong and realtime-capable: XGBoost ensemble-64 reaches `F1=0.9262` with `p99=40.15ms`. ASID still improves F1 by `+5.76pp` over this strong tree baseline and reports `p99=16.69ms` under the final dynamic `tau_k=0.60` fp16 graph-safe serving path. Its validation-selected dynamic budget preserves `F1=0.9838`; paired budget-verified replay reports `avg k=1.890`, while a fixed-`k=2` CUDA Graph serving fast path provides a deployment upper bound of `p99=2.38ms`. High-cost kernel ensembles such as RBF-SVM-64 remain useful as supplementary evidence for the cost of kernelized online scoring.
 
 中文汇报可以写成：
 
-> 外部 baseline 覆盖了三类：官方 TSAD baseline 能实时但精度弱；`RBF-SVM ensemble-24` 给出中间型折中点（`F1=0.8554`, `miss=14.0%`）；监督式外部强精度 ensemble 能把 F1 推到 `0.9262`，但完整回放下 `miss@100ms=13.2%`、`p99=757.82ms`。我们的主模型达到 `F1=0.9838`，同时保持 `0 miss@100ms`，因此不是单纯比弱 baseline 高，而是在高精度和实时性之间同时胜出。
+> 外部 baseline 覆盖了五类：官方 / train-normal-only TSAD baseline 能实时但精度弱；`MTAD-GAT-style full modality` 是 adapted multimodal TSAD，但 strict 下 `F1=0.5499`，不具竞争力；`Eadro official artifact, h128` 是关键同源多模态监督 deep baseline，达到 `F1=0.9336` 且完整回放 `0 miss@100ms`；监督式树模型 baseline 也很强且能实时，`XGBoost ensemble-64` optimized serving 达到 `F1=0.9262 / p99=40.15ms`。我们的主模型达到 `F1=0.9838 / p99=16.69ms`，比 XGBoost-64 高 `+5.76pp`，同时 p99 更低。动态预算主线是 validation-selected `tau_k=0.60`，paired budget-verified replay 得到 `avg k=1.890`；`p99=2.38ms` 则是 fixed `k=2` CUDA Graph serving fast path，不能再写成 dynamic `k(t)`。因此最终叙事应是“比强监督树模型更准，并且具备很强的部署加速路径”，而不是“XGBoost 很慢”。
 
 ## 5. 结果来源
 
 - `results/baselines/xgboost_ensemble64_eadro_strict_s42_metrics_logs_traces_e500_d3/summary.json`
-- `results/baselines/xgboost_ensemble64_eadro_strict_s42_metrics_logs_traces_e500_d3/full_replay_summary.json`
+- `results/baselines/serving_optimized/xgboost64_booster_inplace_568_summary.json`
+- `results/baselines/serving_optimized/xgboost16_booster_inplace_568_summary.json`
+- `results/baselines/serving_optimized/xgboost1_booster_inplace_568_summary.json`
 - `results/baselines/svm_ensemble24_eadro_strict_s42_all_c10/summary.json`
+- `results/baselines/serving_optimized/svm24_resident_568_summary.json`
+- `results/baselines/serving_optimized/svm64_resident_568_summary.json`
 - `results/baselines/eadro_strict_score_ensemble/xgb_mltraces_svm64_rank_step001_summary.json`
 - `results/baselines/eadro_strict_score_ensemble/xgb_mltraces_svm64_rank_step001_replay_summary.json`
 - `results/baselines/svm_ensemble64_eadro_strict_s42_all_c10/summary.json`
 - `results/baselines/gdn_official_eadro_strict_s42_logs_e1/summary.json`
-- `results/baselines/eadro_strict_replay/summary/eadro_strict_replay_summary.json`
+- `results/baselines/serving_optimized/eadro_strict_gdn_official_20260511_150227_summary.json`
+- `results/baselines/serving_optimized/eadro_strict_gdn_20260511_150024_summary.json`
+- `results/baselines/serving_optimized/eadro_strict_tranad_20260511_150025_summary.json`
+- `results/baselines/serving_optimized/eadro_strict_traceanomaly_20260511_151721_summary.json`
+- `results/baselines/serving_optimized/eadro_strict_anomaly_transformer_20260511_150024_summary.json`
+- `results/baselines/serving_optimized/eadro_strict_mtad_gat_style_20260511_150230_summary.json`
+- `results/baselines/mtad_gat_eadro_strict_s42_full_e3/summary.json`
+- `results/baselines/eadro_official_artifact_eadro_strict_s42_e50_h128/summary.json`
+- `results/baselines/serving_optimized/eadro_official_prebuilt_cpu_568_summary.json`
+- `scripts/baselines/run_eadro_official_artifact_eadro_strict.py`

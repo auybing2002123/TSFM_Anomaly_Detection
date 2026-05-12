@@ -67,6 +67,13 @@ from scripts.baselines.run_official_gdn_eadro_strict import (  # noqa: E402
     select_window_tail as gdn_official_select_window_tail,
     vectorize_split as gdn_official_vectorize_split,
 )
+from scripts.baselines.run_mtad_gat_eadro_strict import (  # noqa: E402
+    MTADGATStyle,
+    ScalerState as MTADGATStyleScalerState,
+    apply_scaler as mtad_gat_style_apply_scaler,
+    load_npz as mtad_gat_style_load_npz,
+    vectorize_split as mtad_gat_style_vectorize_split,
+)
 
 
 DEFAULT_SUMMARIES = {
@@ -75,6 +82,7 @@ DEFAULT_SUMMARIES = {
     "anomaly_transformer": PROJECT_ROOT / "results" / "baselines" / "anomaly_transformer_eadro_strict_s42_traces_max" / "summary.json",
     "gdn": PROJECT_ROOT / "results" / "baselines" / "gdn_eadro_strict_s42_logs_w10_e3_minmax" / "summary.json",
     "gdn_official": PROJECT_ROOT / "results" / "baselines" / "gdn_official_eadro_strict_s42_logs_e1" / "summary.json",
+    "mtad_gat_style": PROJECT_ROOT / "results" / "baselines" / "mtad_gat_eadro_strict_s42_full_e3" / "summary.json",
 }
 
 
@@ -101,7 +109,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--baseline",
-        choices=["traceanomaly", "tranad", "anomaly_transformer", "gdn", "gdn_official"],
+        choices=["traceanomaly", "tranad", "anomaly_transformer", "gdn", "gdn_official", "mtad_gat_style"],
         required=True,
         help="Which strict baseline summary/checkpoint to replay.",
     )
@@ -433,6 +441,63 @@ def _timed_official_gdn_inference(
     }
 
 
+def _timed_mtad_gat_style_inference(
+    bundle: EadroReplayBundle,
+    sample_idx: int,
+    prefetched_samples: Optional[Dict[int, WindowSample]] = None,
+) -> Dict[str, Any]:
+    sync_device(bundle.device)
+    total_start = time.perf_counter()
+
+    sample_load_start = time.perf_counter()
+    sample = None if prefetched_samples is None else prefetched_samples.get(sample_idx)
+    if sample is None:
+        sample = _make_sample(bundle, sample_idx)
+    sample_load_ms = (time.perf_counter() - sample_load_start) * 1000.0
+
+    tensorize_start = time.perf_counter()
+    cpu_sample = sample
+    tensorize_ms = (time.perf_counter() - tensorize_start) * 1000.0
+
+    transfer_start = time.perf_counter()
+    use_non_blocking = bundle.device.type == "cuda" and cpu_sample.is_pinned()
+    device_sample = cpu_sample.to(bundle.device, non_blocking=use_non_blocking)
+    sync_device(bundle.device)
+    transfer_ms = (time.perf_counter() - transfer_start) * 1000.0
+
+    inference_start = time.perf_counter()
+    forecast, reconstruction = bundle.model(device_sample.window)
+    sync_device(bundle.device)
+    inference_ms = (time.perf_counter() - inference_start) * 1000.0
+
+    postprocess_start = time.perf_counter()
+    forecast_error = ((forecast - device_sample.window[:, -1, :]) ** 2).mean(dim=-1)
+    recon_error = ((reconstruction - device_sample.window) ** 2).mean(dim=(1, 2))
+    forecast_weight = float(bundle.metadata["forecast_weight"])
+    recon_weight = float(bundle.metadata["recon_weight"])
+    score = float((forecast_weight * forecast_error + recon_weight * recon_error).view(-1).detach().cpu().item())
+    prediction = score_to_prediction(score, bundle.direction, bundle.threshold)
+    label = bool(device_sample.label.item() > 0)
+    postprocess_ms = (time.perf_counter() - postprocess_start) * 1000.0
+    total_ms = (time.perf_counter() - total_start) * 1000.0
+
+    return {
+        "sample_idx": sample_idx,
+        "source_id": cpu_sample.source_id,
+        "label": label,
+        "prediction": prediction,
+        "threshold": float(bundle.threshold),
+        "direction": bundle.direction,
+        "anomaly_score": score,
+        "sample_load_ms": sample_load_ms,
+        "tensorize_ms": tensorize_ms,
+        "transfer_ms": transfer_ms,
+        "inference_ms": inference_ms,
+        "postprocess_ms": postprocess_ms,
+        "total_ms": total_ms,
+    }
+
+
 def _load_tranad_bundle(summary_path: Path, device: torch.device) -> EadroReplayBundle:
     summary = load_json(summary_path)
     export_dir = maybe_resolve_path(summary["export_dir"])
@@ -679,6 +744,72 @@ def _load_official_gdn_bundle(summary_path: Path, device: torch.device) -> Eadro
     )
 
 
+def _load_mtad_gat_style_bundle(summary_path: Path, device: torch.device) -> EadroReplayBundle:
+    summary = load_json(summary_path)
+    export_dir = maybe_resolve_path(summary["export_dir"])
+    checkpoint_path = maybe_resolve_path(summary["artifacts"]["checkpoint"])
+
+    checkpoint_data = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    scaler_payload = checkpoint_data["scaler"]
+    scaler = MTADGATStyleScalerState(
+        kind=str(scaler_payload["kind"]),
+        center=np.asarray(scaler_payload["center"], dtype=np.float32),
+        scale=np.asarray(scaler_payload["scale"], dtype=np.float32),
+        scaled_clip=(
+            None
+            if scaler_payload.get("scaled_clip") is None
+            else float(scaler_payload["scaled_clip"])
+        ),
+    )
+
+    test_split = mtad_gat_style_vectorize_split(
+        mtad_gat_style_load_npz(export_dir / "test.npz"),
+        summary["representation"],
+        "test",
+    )
+    test_windows_scaled = mtad_gat_style_apply_scaler(test_split.windows, scaler)
+
+    model = MTADGATStyle(
+        seq_len=int(summary["input_manifest"]["seq_len"]),
+        feature_dim=int(summary["input_manifest"]["feature_dim"]),
+        hidden_dim=int(summary["hidden_dim"]),
+        temporal_heads=int(summary["temporal_heads"]),
+        feature_heads=int(summary["feature_heads"]),
+        dropout=float(summary["dropout"]),
+    ).to(device)
+    model.load_state_dict(checkpoint_data["model_state_dict"])
+    model.eval()
+
+    return EadroReplayBundle(
+        baseline_key="mtad_gat_style",
+        baseline_name="MTAD-GAT-style",
+        model=model,
+        test_windows=test_windows_scaled.astype(np.float32),
+        test_labels=test_split.labels.astype(np.int64),
+        source_ids=list(test_split.ids),
+        threshold=float(summary["validation_selection"]["threshold"]),
+        direction=str(summary["validation_selection"]["direction"]),
+        device=device,
+        torch_dtype=torch.float32,
+        step_size_ms=100.0,
+        metadata={
+            "representation": summary["representation"],
+            "scaler": summary["scaler"],
+            "seq_len": int(summary["input_manifest"]["seq_len"]),
+            "feature_dim": int(summary["input_manifest"]["feature_dim"]),
+            "hidden_dim": int(summary["hidden_dim"]),
+            "temporal_heads": int(summary["temporal_heads"]),
+            "feature_heads": int(summary["feature_heads"]),
+            "forecast_weight": float(summary["forecast_weight"]),
+            "recon_weight": float(summary["recon_weight"]),
+            "checkpoint": str(checkpoint_path),
+            "export_dir": str(export_dir),
+            "result_dir": summary["result_dir"],
+        },
+        offline_summary=summary,
+    )
+
+
 def _load_bundle(summary_path: Path, device: torch.device) -> tuple[EadroReplayBundle, Callable[..., Dict[str, Any]]]:
     summary = load_json(summary_path)
     baseline = str(summary["baseline"]).lower()
@@ -690,6 +821,8 @@ def _load_bundle(summary_path: Path, device: torch.device) -> tuple[EadroReplayB
         return _load_gdn_bundle(summary_path, device), _timed_gdn_inference
     if baseline in {"gdn-official", "gdn official"}:
         return _load_official_gdn_bundle(summary_path, device), _timed_official_gdn_inference
+    if baseline in {"mtad-gat-style", "mtad_gat_style"}:
+        return _load_mtad_gat_style_bundle(summary_path, device), _timed_mtad_gat_style_inference
     raise ValueError(f"Unsupported strict replay baseline: {summary['baseline']}")
 
 

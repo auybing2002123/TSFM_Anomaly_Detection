@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 from typing import Optional
+from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
@@ -95,11 +96,8 @@ class ServiceAwareMoELoRALayer(MoELoRALayer):
             router_logits = router_logits + self.service_prior_strength * self.service_prior[service_ids]
 
         router_probs = torch.softmax(router_logits, dim=-1)
-        if 0 < self.router_topk < self.num_experts:
-            values, indices = torch.topk(router_probs, k=self.router_topk, dim=-1)
-            sparse = torch.zeros_like(router_probs)
-            sparse.scatter_(1, indices, values)
-            router_probs = sparse / sparse.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        self.last_router_dense_probs = router_probs.detach()
+        router_probs = self._apply_router_budget(router_probs)
         self._router_probs_for_loss = router_probs
         self.last_router_probs = router_probs.detach()
         return router_probs
@@ -178,29 +176,93 @@ def apply_service_aware_moe_to_gpt2(
     return gpt2_model
 
 
+def iter_service_aware_moe_layers(module: nn.Module) -> list[ServiceAwareMoELoRALayer]:
+    cached_layers = getattr(module, "_service_aware_moe_layers_cache", None)
+    if cached_layers is None:
+        cached_layers = [child for child in module.modules() if isinstance(child, ServiceAwareMoELoRALayer)]
+        setattr(module, "_service_aware_moe_layers_cache", cached_layers)
+    return cached_layers
+
+
 def set_service_ids_for_module(module: nn.Module, service_ids: torch.Tensor) -> None:
-    for child in module.modules():
-        if isinstance(child, ServiceAwareMoELoRALayer):
-            child.set_runtime_service_ids(service_ids)
+    for child in iter_service_aware_moe_layers(module):
+        child.set_runtime_service_ids(service_ids)
 
 
 def collect_service_aware_moe_balance_loss(module: nn.Module) -> torch.Tensor:
     losses = []
-    for child in module.modules():
-        if isinstance(child, ServiceAwareMoELoRALayer):
-            loss = child.load_balance_loss()
-            if loss is not None:
-                losses.append(loss)
+    for child in iter_service_aware_moe_layers(module):
+        loss = child.load_balance_loss()
+        if loss is not None:
+            losses.append(loss)
     if not losses:
         device = next(module.parameters()).device
         return torch.zeros((), device=device)
     return torch.stack(losses).mean()
 
 
-def clear_service_aware_routing_cache(module: nn.Module) -> None:
-    for child in module.modules():
-        if isinstance(child, ServiceAwareMoELoRALayer):
+def clear_service_aware_routing_cache(module: nn.Module, *, clear_service_ids: bool = True) -> None:
+    for child in iter_service_aware_moe_layers(module):
+        if clear_service_ids:
             child.clear_routing_cache()
+        else:
+            child._router_probs_for_loss = None
+
+
+class GraphSafeGPT2Forward(nn.Module):
+    def __init__(self, gpt2_model: nn.Module) -> None:
+        super().__init__()
+        self.gpt2 = gpt2_model
+        max_positions = int(getattr(gpt2_model.config, "n_positions", 1024))
+        self.register_buffer("cache_position", torch.arange(max_positions, dtype=torch.long), persistent=False)
+        self.register_buffer("position_ids", torch.arange(max_positions, dtype=torch.long).unsqueeze(0), persistent=False)
+        causal_mask = torch.full((max_positions, max_positions), torch.finfo(torch.float32).min)
+        causal_mask = torch.triu(causal_mask, diagonal=1)
+        self.register_buffer("causal_attention_mask", causal_mask.view(1, 1, max_positions, max_positions), persistent=False)
+
+    def forward(
+        self,
+        *,
+        inputs_embeds: torch.Tensor,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        use_cache: bool = False,
+        return_dict: bool = True,
+        **kwargs,
+    ):
+        del output_attentions, output_hidden_states, use_cache, return_dict, kwargs
+        batch_size, seq_len = inputs_embeds.shape[:2]
+        position_ids = self.position_ids[:, :seq_len]
+        cache_position = self.cache_position[:seq_len]
+        attention_mask = self.causal_attention_mask[:, :, :seq_len, :seq_len]
+        hidden_states = inputs_embeds + self.gpt2.wpe(position_ids).to(inputs_embeds.device)
+        hidden_states = self.gpt2.drop(hidden_states)
+        for block in self.gpt2.h:
+            outputs = block(
+                hidden_states,
+                past_key_values=None,
+                cache_position=cache_position,
+                attention_mask=attention_mask,
+                head_mask=None,
+                encoder_hidden_states=None,
+                encoder_attention_mask=None,
+                use_cache=False,
+                output_attentions=False,
+            )
+            hidden_states = outputs[0]
+        hidden_states = self.gpt2.ln_f(hidden_states)
+        hidden_states = hidden_states.view((batch_size, seq_len, hidden_states.size(-1)))
+        return SimpleNamespace(last_hidden_state=hidden_states)
+
+
+def enable_graph_safe_gpt2_forward(module: nn.Module) -> None:
+    gpt2 = getattr(module, "gpt2", None)
+    if gpt2 is None or isinstance(gpt2, GraphSafeGPT2Forward):
+        return
+    if hasattr(gpt2, "config"):
+        gpt2.config._attn_implementation = "sdpa"
+    device = next(gpt2.parameters()).device
+    module.gpt2 = GraphSafeGPT2Forward(gpt2).to(device)
 
 
 class MultiModalServiceAwareMoE_MSDS(nn.Module):
@@ -331,7 +393,15 @@ class MultiModalServiceAwareMoE_MSDS(nn.Module):
         fused = self.fusion_proj(fused)
 
         gpt_input = fused.permute(0, 2, 1, 3).reshape(batch_size * num_hosts, seq_len, self.config.gpt2_dim)
-        service_ids = torch.arange(num_hosts, device=gpt_input.device).repeat(batch_size)
+        service_cache = getattr(self, "_runtime_service_ids_cache", None)
+        if (
+            service_cache is None
+            or service_cache.device != gpt_input.device
+            or service_cache.numel() != batch_size * num_hosts
+        ):
+            service_cache = torch.arange(num_hosts, device=gpt_input.device).repeat(batch_size)
+            self._runtime_service_ids_cache = service_cache
+        service_ids = service_cache
         set_service_ids_for_module(self.gpt2, service_ids)
         gpt_output = self.gpt2(
             inputs_embeds=gpt_input,
@@ -355,6 +425,11 @@ class MultiModalServiceAwareMoE_MSDS(nn.Module):
             self.latest_cls_logits = None
             self.latest_cls_probs = None
 
+        if evaluate:
+            cls_probs = torch.softmax(cls_result, dim=-1)
+            clear_service_aware_routing_cache(self.gpt2, clear_service_ids=False)
+            return cls_probs, groundtruth_cls
+
         recon_input = gpt_output[:, -1, :]
         recon = self.recon_head(recon_input).reshape(batch_size, num_hosts, -1)
 
@@ -362,11 +437,6 @@ class MultiModalServiceAwareMoE_MSDS(nn.Module):
         original_log = data_log[:, -1, :, :]
         original = torch.cat([original_metric, original_log], dim=-1)
         rec_error = torch.square(recon - original)
-
-        if evaluate:
-            cls_probs = torch.softmax(cls_result, dim=-1)
-            clear_service_aware_routing_cache(self.gpt2)
-            return cls_probs, groundtruth_cls
 
         total_loss, rec_loss, cls_loss = self.mstgad_loss(rec_error, cls_result, groundtruth_cls)
         pred_loss = F.mse_loss(pred_last, actual_last.detach())

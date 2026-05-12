@@ -32,6 +32,7 @@ from scripts.realtime.common import (  # noqa: E402
     percentile,
     prefetch_sample_batches,
     prepare_sample_batch,
+    resolve_amp_dtype,
     save_json,
     save_jsonl,
     summarize_latency_records,
@@ -63,15 +64,58 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pace", action="store_true")
     parser.add_argument("--prefetch", action="store_true")
     parser.add_argument("--pin-memory", action="store_true")
+    parser.add_argument(
+        "--precision",
+        choices=["fp32", "fp16", "bf16"],
+        default="fp32",
+        help="CUDA autocast precision for inference-only replay.",
+    )
+    parser.add_argument(
+        "--timing-mode",
+        choices=["detailed", "end_to_end"],
+        default="detailed",
+        help=(
+            "detailed keeps per-stage CUDA synchronization for profiling; "
+            "end_to_end avoids profiling synchronizations and measures deployment-style latency."
+        ),
+    )
+    parser.add_argument(
+        "--skip-routing-budget",
+        action="store_true",
+        help="Skip per-window router-budget diagnostics during replay to measure the lean serving path.",
+    )
+    parser.add_argument(
+        "--matmul-precision",
+        choices=["default", "highest", "high", "medium"],
+        default="default",
+        help="Optional torch float32 matmul precision setting for CUDA inference.",
+    )
     parser.add_argument("--output-dir", type=str, default="results/experiments/eadro_sn/realtime")
     parser.add_argument("--print-every", type=int, default=10)
     return parser.parse_args()
+
+
+_REPLAY_AMP_DTYPE: torch.dtype | None = None
+
+
+def set_replay_amp_dtype(dtype: torch.dtype | None) -> None:
+    global _REPLAY_AMP_DTYPE
+    _REPLAY_AMP_DTYPE = dtype
 
 
 def resolve_device(name: str) -> torch.device:
     if name == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(name)
+
+
+def configure_matmul_precision(mode: str, device: torch.device) -> None:
+    if mode == "default":
+        return
+    torch.set_float32_matmul_precision(mode)
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = mode in {"high", "medium"}
+        torch.backends.cudnn.allow_tf32 = mode in {"high", "medium"}
 
 
 def resolve_path(path_like: str | Path, base_dir: Optional[Path] = None) -> Path:
@@ -132,20 +176,98 @@ def maybe_disable_modalities(batch: SampleBatch, ckpt_args: Mapping[str, Any]) -
     )
 
 
+def move_prefetched_batches_to_device(
+    prefetched_batches: Mapping[int, SampleBatch],
+    device: torch.device,
+    ckpt_args: Mapping[str, Any],
+    max_extra_mb: float,
+) -> tuple[Dict[int, SampleBatch], Dict[str, Any]]:
+    if device.type != "cuda":
+        raise ValueError("GPU-resident prefetch requires a CUDA device")
+
+    sync_device(device)
+    start_alloc = torch.cuda.memory_allocated(device)
+    resident: Dict[int, SampleBatch] = {}
+    for index, batch in prefetched_batches.items():
+        batch_device = maybe_disable_modalities(batch.to(device, non_blocking=batch.is_pinned()), ckpt_args)
+        resident[int(index)] = batch_device
+        if max_extra_mb > 0 and len(resident) % 32 == 0:
+            sync_device(device)
+            extra_mb = (torch.cuda.memory_allocated(device) - start_alloc) / (1024 * 1024)
+            if extra_mb > max_extra_mb:
+                raise RuntimeError(
+                    f"GPU resident prefetch exceeded limit: {extra_mb:.2f} MB > {max_extra_mb:.2f} MB"
+                )
+
+    sync_device(device)
+    end_alloc = torch.cuda.memory_allocated(device)
+    return resident, {
+        "count": len(resident),
+        "extra_allocated_mb": (end_alloc - start_alloc) / (1024 * 1024),
+        "max_extra_mb": max_extra_mb,
+    }
+
+
 @torch.inference_mode()
 def run_eadro_inference(
     model: torch.nn.Module,
     batch: SampleBatch,
     device: torch.device,
 ) -> torch.Tensor:
-    cls_probs, _ = model(
-        batch.data_node,
-        batch.data_log,
-        batch.data_edge,
-        batch.groundtruth_cls,
-        evaluate=True,
-    )
+    if _REPLAY_AMP_DTYPE is not None and device.type == "cuda":
+        with torch.autocast(device_type="cuda", dtype=_REPLAY_AMP_DTYPE):
+            cls_probs, _ = model(
+                batch.data_node,
+                batch.data_log,
+                batch.data_edge,
+                batch.groundtruth_cls,
+                evaluate=True,
+            )
+    else:
+        cls_probs, _ = model(
+            batch.data_node,
+            batch.data_log,
+            batch.data_edge,
+            batch.groundtruth_cls,
+            evaluate=True,
+        )
     return cls_probs.detach().cpu()
+
+
+def collect_router_budget_summary(model: torch.nn.Module) -> Dict[str, Any]:
+    selected_k_values: list[int] = []
+    active_expert_values: list[int] = []
+    layer_count = 0
+    for module in model.modules():
+        selected_k = getattr(module, "last_router_selected_k", None)
+        router_probs = getattr(module, "last_router_probs", None)
+        if selected_k is None and router_probs is None:
+            continue
+        layer_count += 1
+        if selected_k is not None:
+            selected_k_values.extend(int(value) for value in selected_k.detach().cpu().reshape(-1).tolist())
+        if router_probs is not None:
+            active_counts = (router_probs.detach().cpu() > 0).sum(dim=-1).reshape(-1)
+            active_expert_values.extend(int(value) for value in active_counts.tolist())
+
+    def _summarize(values: list[int]) -> Dict[str, Any]:
+        if not values:
+            return {"count": 0, "mean": 0.0, "histogram": {}}
+        histogram: dict[str, int] = {}
+        for value in values:
+            key = str(int(value))
+            histogram[key] = histogram.get(key, 0) + 1
+        return {
+            "count": len(values),
+            "mean": float(np.mean(values)),
+            "histogram": histogram,
+        }
+
+    return {
+        "router_layer_count": layer_count,
+        "selected_k": _summarize(selected_k_values),
+        "active_experts": _summarize(active_expert_values),
+    }
 
 
 def extract_true_root_services(batch: SampleBatch, service_names: list[str]) -> list[str]:
@@ -232,15 +354,22 @@ def timed_eadro_window_inference(
     threshold: float,
     preloaded_batch: Optional[SampleBatch] = None,
     window_score_method: str = "max",
+    timing_mode: str = "detailed",
+    collect_routing_budget: bool = True,
+    preloaded_modalities_ready: bool = False,
 ) -> Dict[str, Any]:
-    sync_device(bundle.device)
+    detailed_timing = timing_mode == "detailed"
+    if detailed_timing:
+        sync_device(bundle.device)
     t0 = time.perf_counter()
     if preloaded_batch is None:
         sample = bundle.dataset[sample_idx]
-        sync_device(bundle.device)
+        if detailed_timing:
+            sync_device(bundle.device)
         t1 = time.perf_counter()
         batch_cpu = prepare_sample_batch(sample, sample_idx, bundle.split_name)
-        sync_device(bundle.device)
+        if detailed_timing:
+            sync_device(bundle.device)
         t2 = time.perf_counter()
     else:
         batch_cpu = preloaded_batch
@@ -249,12 +378,16 @@ def timed_eadro_window_inference(
 
     non_blocking_transfer = bundle.device.type == "cuda" and batch_cpu.is_pinned()
     batch_device = batch_cpu.to(bundle.device, non_blocking=non_blocking_transfer)
-    batch_device = maybe_disable_modalities(batch_device, ckpt_args)
-    sync_device(bundle.device)
+    if not preloaded_modalities_ready:
+        batch_device = maybe_disable_modalities(batch_device, ckpt_args)
+    if detailed_timing:
+        sync_device(bundle.device)
     t3 = time.perf_counter()
 
     cls_probs = run_eadro_inference(bundle.model, batch_device, bundle.device)
-    sync_device(bundle.device)
+    routing_budget = collect_router_budget_summary(bundle.model) if collect_routing_budget else {}
+    if detailed_timing:
+        sync_device(bundle.device)
     t4 = time.perf_counter()
 
     prediction = summarize_prediction(
@@ -266,7 +399,8 @@ def timed_eadro_window_inference(
     )
     true_root_services = extract_true_root_services(batch_cpu, bundle.service_names)
     true_abnormal_services = extract_true_abnormal_services(batch_cpu, bundle.service_names)
-    sync_device(bundle.device)
+    if detailed_timing:
+        sync_device(bundle.device)
     t5 = time.perf_counter()
 
     return {
@@ -281,6 +415,8 @@ def timed_eadro_window_inference(
         "true_root_services": true_root_services,
         "true_abnormal_services": true_abnormal_services,
         "window_anomaly_label": bool(true_abnormal_services),
+        "routing_budget": routing_budget,
+        "timing_mode": timing_mode,
         **prediction,
     }
 
@@ -293,6 +429,9 @@ def warmup_runtime(
     threshold: float,
     prefetched_batches: Optional[Mapping[int, SampleBatch]] = None,
     window_score_method: str = "max",
+    timing_mode: str = "detailed",
+    collect_routing_budget: bool = True,
+    preloaded_modalities_ready: bool = False,
 ) -> None:
     warmup_count = max(0, min(warmup_samples, len(bundle.dataset) - start_index))
     for offset in range(warmup_count):
@@ -304,6 +443,9 @@ def warmup_runtime(
             threshold=threshold,
             preloaded_batch=None if prefetched_batches is None else prefetched_batches.get(sample_idx),
             window_score_method=window_score_method,
+            timing_mode=timing_mode,
+            collect_routing_budget=collect_routing_budget,
+            preloaded_modalities_ready=preloaded_modalities_ready,
         )
 
 
@@ -462,6 +604,9 @@ def load_runtime_bundle_eadro(
 def main() -> int:
     args = parse_args()
     device = resolve_device(args.device)
+    configure_matmul_precision(args.matmul_precision, device)
+    amp_dtype = resolve_amp_dtype(args.precision, device)
+    set_replay_amp_dtype(amp_dtype)
 
     checkpoint_path = resolve_path(args.checkpoint)
     if not checkpoint_path.exists():
@@ -494,17 +639,20 @@ def main() -> int:
 
     output_dir = ensure_dir(resolve_path(args.output_dir))
     run_name = checkpoint_path.parent.name
-    run_id = f"{run_name}_{args.split}_{timestamp_tag()}"
+    run_id = f"{run_name}_{args.split}_{args.precision}_{timestamp_tag()}"
 
     print(f"Loaded {len(bundle.dataset)} samples from Eadro-SN/{args.split}")
     print(f"Checkpoint   : {bundle.checkpoint_path}")
     print(f"Device       : {bundle.device}")
+    print(f"Precision    : {args.precision}")
+    print(f"MatMul       : {args.matmul_precision}")
     print(f"Threshold    : {threshold:.4f} ({threshold_source})")
     print(f"Window Score : {args.window_score_method}")
     print(
         f"Interval     : {interval_ms:.2f} ms, Deadline: {deadline_ms:.2f} ms, "
         f"Pace={args.pace}, Prefetch={args.prefetch}, PinMemory={args.pin_memory}"
     )
+    print(f"Timing Mode  : {args.timing_mode}, RoutingBudget={not args.skip_routing_budget}")
 
     prefetched_batches = None
     prefetch_wall_ms = 0.0
@@ -528,6 +676,8 @@ def main() -> int:
         threshold=threshold,
         prefetched_batches=prefetched_batches,
         window_score_method=args.window_score_method,
+        timing_mode=args.timing_mode,
+        collect_routing_budget=not args.skip_routing_budget,
     )
 
     if bundle.device.type == "cuda":
@@ -552,6 +702,8 @@ def main() -> int:
             threshold=threshold,
             preloaded_batch=None if prefetched_batches is None else prefetched_batches.get(sample_idx),
             window_score_method=args.window_score_method,
+            timing_mode=args.timing_mode,
+            collect_routing_budget=not args.skip_routing_budget,
         )
         finish_time = time.perf_counter()
         response_time_ms = (finish_time - scheduled_release) * 1000.0
@@ -626,6 +778,10 @@ def main() -> int:
         "mode": "paced_replay" if args.pace else "as_fast_as_possible",
         "prefetch_enabled": args.prefetch,
         "pin_memory_enabled": args.pin_memory,
+        "precision": args.precision,
+        "matmul_precision": args.matmul_precision,
+        "timing_mode": args.timing_mode,
+        "routing_budget_collected": not args.skip_routing_budget,
         "prefetch_wall_ms": prefetch_wall_ms,
         "num_steps": max_steps,
         "start_index": args.start_index,

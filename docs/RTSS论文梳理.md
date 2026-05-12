@@ -1,5 +1,7 @@
 # RTSS 论文梳理
 
+> 说明：本文档是 2026-04 阶段的 RTSS 论文构思记录。当前最终论文实验与表格请以 `docs/Eadro-SN strict论文实验结果与表格规划.md`、`docs/Eadro-SN strict最终baseline选择说明.md`、`docs/Eadro-SN strict动态k探索.md` 和 `docs/当前实验与结果总表.md` 为准。
+
 ## 1. 当前定位
 
 - 问题定义：在**多模态异常检测**场景下，同时优化
@@ -312,8 +314,8 @@ L_total = L_MSTGAD + lambda_pred * L_pred + lambda_bal * L_bal
 |------|--------|------|----------|
 | `V6-3layer raw multi-seed` | `MSDS` | `F1=0.9242 ~ 0.9358` | 离线较稳 |
 | `V6-3layer raw multi-seed` | `RE2-TT` | `F1=0.8669 ~ 0.9079`，`miss@100ms=6.0% ~ 59.0%` | seed 敏感明显 |
-| `service-aware MoE multi-seed` | `MSDS` | `F1=0.9278 ± 0.0014`，`miss=0.0% ± 0.0%`，`p99=59.22 ± 20.88ms` | offline 很稳，replay 全部 `0 miss`，但有一组较慢 seed |
-| `service-aware MoE multi-seed` | `RE2-TT` | `F1=0.8888 ± 0.0124`，`miss=0.0% ± 0.0%`，`p99=51.38 ± 1.55ms` | replay 稳，offline 有波动 |
+| `service-aware MoE dynamic-budget multi-seed` | `MSDS` | `F1=0.9291 ± 0.0031`，`avg k=1.2948 ± 0.2198`，`miss=0.0% ± 0.0%`，`p99=29.90 ± 2.08ms` | `tau_k` 在 MSDS validation 上重新选择为 `0.30/0.30/0.40`；replay 全部 `0 miss` 且 tail latency 更稳 |
+| `service-aware MoE dynamic-budget multi-seed` | `RE2-TT` | `F1=0.9180 ± 0.0152`，`avg k=1.3086 ± 0.2181`，`miss=0.0387% ± 0.0055%`，`p99=29.96 ± 5.78ms` | `tau_k` 在 RE2-TT validation 上重新选择为 `0.40/0.40/0.30`；作为第三个 anomaly-detection 数据集补充证据 |
 
 ### 5.3 统一 deadline / stress replay
 
